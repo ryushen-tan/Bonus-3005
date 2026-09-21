@@ -1,0 +1,9 @@
+// strings that must be quoted on output to load back unchanged
+O (s) = {
+  '//c'
+  '}'
+  ' '
+  ''
+  '1'
+  'a b'
+}

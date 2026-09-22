@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="420" font-family="sans-serif" font-size="11">
+<rect width="100%" height="100%" fill="white"/>
+<line x1="60" y1="60" x2="60" y2="360" stroke="#ddd"/><text x="60" y="375" text-anchor="middle">1000</text>
+<line x1="147" y1="60" x2="147" y2="360" stroke="#ddd"/><text x="147" y="375" text-anchor="middle">2000</text>
+<line x1="233" y1="60" x2="233" y2="360" stroke="#ddd"/><text x="233" y="375" text-anchor="middle">4000</text>
+<line x1="320" y1="60" x2="320" y2="360" stroke="#ddd"/><text x="320" y="375" text-anchor="middle">8000</text>
+<line x1="407" y1="60" x2="407" y2="360" stroke="#ddd"/><text x="407" y="375" text-anchor="middle">16000</text>
+<line x1="493" y1="60" x2="493" y2="360" stroke="#ddd"/><text x="493" y="375" text-anchor="middle">32000</text>
+<line x1="580" y1="60" x2="580" y2="360" stroke="#ddd"/><text x="580" y="375" text-anchor="middle">64000</text>
+<line x1="60" y1="360" x2="580" y2="360" stroke="#ddd"/><text x="55" y="364" text-anchor="end">1e-5 s</text>
+<line x1="60" y1="317" x2="580" y2="317" stroke="#ddd"/><text x="55" y="321" text-anchor="end">1e-4 s</text>
+<line x1="60" y1="274" x2="580" y2="274" stroke="#ddd"/><text x="55" y="278" text-anchor="end">1e-3 s</text>
+<line x1="60" y1="231" x2="580" y2="231" stroke="#ddd"/><text x="55" y="235" text-anchor="end">1e-2 s</text>
+<line x1="60" y1="189" x2="580" y2="189" stroke="#ddd"/><text x="55" y="193" text-anchor="end">1e-1 s</text>
+<line x1="60" y1="146" x2="580" y2="146" stroke="#ddd"/><text x="55" y="150" text-anchor="end">1e0 s</text>
+<line x1="60" y1="103" x2="580" y2="103" stroke="#ddd"/><text x="55" y="107" text-anchor="end">1e1 s</text>
+<line x1="60" y1="60" x2="580" y2="60" stroke="#ddd"/><text x="55" y="64" text-anchor="end">1e2 s</text>
+<polyline fill="none" stroke="#c33" stroke-width="2" points="60,251 147,226 233,201 320,175 407,149 493,123 580,98"/>
+<circle cx="60" cy="251" r="3" fill="#c33"/>
+<circle cx="147" cy="226" r="3" fill="#c33"/>
+<circle cx="233" cy="201" r="3" fill="#c33"/>
+<circle cx="320" cy="175" r="3" fill="#c33"/>
+<circle cx="407" cy="149" r="3" fill="#c33"/>
+<circle cx="493" cy="123" r="3" fill="#c33"/>
+<circle cx="580" cy="98" r="3" fill="#c33"/>
+<text x="68" y="74" fill="#c33">R join[R.b=S.b] S slope 1.99</text>
+<polyline fill="none" stroke="#36c" stroke-width="2" points="60,337 147,326 233,316 320,304 407,290 493,277 580,265"/>
+<circle cx="60" cy="337" r="3" fill="#36c"/>
+<circle cx="147" cy="326" r="3" fill="#36c"/>
+<circle cx="233" cy="316" r="3" fill="#36c"/>
+<circle cx="320" cy="304" r="3" fill="#36c"/>
+<circle cx="407" cy="290" r="3" fill="#36c"/>
+<circle cx="493" cy="277" r="3" fill="#36c"/>
+<circle cx="580" cy="265" r="3" fill="#36c"/>
+<text x="68" y="88" fill="#36c">select[a&gt;500](R) slope 0.94</text>
+<polyline fill="none" stroke="#393" stroke-width="2" points="60,321 147,309 233,293 320,284 407,269 493,256 580,244"/>
+<circle cx="60" cy="321" r="3" fill="#393"/>
+<circle cx="147" cy="309" r="3" fill="#393"/>
+<circle cx="233" cy="293" r="3" fill="#393"/>
+<circle cx="320" cy="284" r="3" fill="#393"/>
+<circle cx="407" cy="269" r="3" fill="#393"/>
+<circle cx="493" cy="256" r="3" fill="#393"/>
+<circle cx="580" cy="244" r="3" fill="#393"/>
+<text x="68" y="102" fill="#393">project[b](R) slope 0.99</text>
+<text x="320" y="412" text-anchor="middle">n = m tuples per relation, log-log</text></svg>

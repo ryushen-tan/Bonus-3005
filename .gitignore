@@ -1,5 +1,15 @@
 ra
 gen
+storage
+exec
+sql
+opt
+db
 ratest
+storagetest
+exectest
+sqltest
+opttest
 *.dSYM/
 .DS_Store
+tests/tmp-*/

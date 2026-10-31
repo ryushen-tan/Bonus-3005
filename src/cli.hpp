@@ -64,7 +64,7 @@ inline Json schemaJson(const std::vector<Col>& cols, bool qualify) {
     Json j = jsonArray();
     for (const Col& c : cols) {
         Json col = jsonArray();
-        col.push(jsonString(qualify ? qualified(c) : c.name)).push(jsonString(c.type == StrT ? "VARCHAR" : c.type == RealT ? "REAL" : "INT"));
+        col.push(jsonString(qualify ? qualified(c) : c.name)).push(jsonString(c.type == StrT ? "VARCHAR" : c.type == RealT ? "REAL" : c.type == BigT ? "BIGINT" : "INT"));
         if (c.type == StrT) col.push(jsonNumber(c.length));
         j.push(col);
     }

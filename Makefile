@@ -1,7 +1,7 @@
 CXX = clang++
 CXXFLAGS = -std=c++17 -O2 -Wall -Wextra -Werror
-TOOLS = ra gen storage
-TESTS = ratest storagetest
+TOOLS = ra gen storage exec
+TESTS = ratest storagetest exectest
 
 all: $(TOOLS)
 
@@ -20,9 +20,16 @@ ratest: tests/test.cpp src/*.hpp
 storagetest: tests/test_storage.cpp src/*.hpp
 	$(CXX) $(CXXFLAGS) -o $@ $<
 
+exec: src/exec.cpp src/*.hpp
+	$(CXX) $(CXXFLAGS) -o $@ $<
+
+exectest: tests/test_exec.cpp src/*.hpp
+	$(CXX) $(CXXFLAGS) -o $@ $<
+
 test: $(TESTS)
 	./ratest
 	./storagetest
+	./exectest
 
 perf: ra gen
 	sh perf/run.sh > perf/results.tsv && python3 perf/plot.py perf/results.tsv

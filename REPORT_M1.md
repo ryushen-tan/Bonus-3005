@@ -79,7 +79,7 @@ Trace 4 shows the cost to other work: ten hot pages would fit easily in 16 frame
 only every twentieth access, and the 300 page scan pushes nineteen other pages through between two
 touches, so at B = 16 not one of the hot accesses hits.
 
-**Which I would ship: CLOCK.** On the four traces that are not pure scans, CLOCK is within 0.016 of LRU's
+**Which I would ship: CLOCK.** On the four traces that are not pure scans, CLOCK is within 0.018 of LRU's
 hit rate everywhere, and on trace 3 they are equally bad. CLOCK costs a reference bit and a hand, with
 no ordering to keep on every hit. My LRU searches all B stamps on each miss, and a real one would need a
 list update under a latch on every hit. Sequential flooding is not something either policy fixes, so I

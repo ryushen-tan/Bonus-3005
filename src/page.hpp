@@ -10,8 +10,8 @@ inline uint32_t get32(const uint8_t* p) { return uint32_t(p[0]) | uint32_t(p[1])
 inline void put16(uint8_t* p, uint16_t v) { p[0] = uint8_t(v); p[1] = uint8_t(v >> 8); }
 inline void put32(uint8_t* p, uint32_t v) { for (int i = 0; i < 4; i++) p[i] = uint8_t(v >> (8 * i)); }
 
-// a record is its fields in schema order: INT as 4 bytes, VARCHAR as a 2 byte length then the bytes,
-// and REAL (only ever an AVG in a temporary file) as the 8 bytes of a double
+// a record is its fields in schema order: INT as 4 bytes, VARCHAR as a 2 byte length then the bytes;
+// in temporary files only, REAL (an AVG) as the 8 bytes of a double and BIGINT (a SUM) as 8 bytes
 inline Value intValue(long long i) { return {true, double(i), std::to_string(i)}; }
 inline Value realValue(double d) { char text[64]; std::snprintf(text, sizeof text, "%.4f", d); return {true, d, text}; }
 inline void encodeInto(std::string& out, const std::vector<Col>& cols, const Row& row) {
@@ -23,6 +23,10 @@ inline void encodeInto(std::string& out, const std::vector<Col>& cols, const Row
             out += row[i].text;
         } else if (cols[i].type == RealT) {
             std::memcpy(bytes, &row[i].num, 8);
+            out.append((const char*)bytes, 8);
+        } else if (cols[i].type == BigT) {
+            int64_t n = std::stoll(row[i].text);
+            std::memcpy(bytes, &n, 8);
             out.append((const char*)bytes, 8);
         } else {
             put32(bytes, uint32_t(int32_t(row[i].num)));
@@ -38,13 +42,14 @@ inline Row decode(const std::vector<Col>& cols, std::string_view record) {
     for (const Col& c : cols) {
         if (c.type == StrT) { uint16_t n = get16(p); row.push_back({false, 0, std::string((const char*)p + 2, n)}); p += 2 + n; }
         else if (c.type == RealT) { double d; std::memcpy(&d, p, 8); row.push_back(realValue(d)); p += 8; }
+        else if (c.type == BigT) { int64_t n; std::memcpy(&n, p, 8); row.push_back(intValue(n)); p += 8; }
         else { row.push_back(intValue(int32_t(get32(p)))); p += 4; }
     }
     return row;
 }
 inline size_t encodedSize(const std::vector<Col>& cols, const Row& row) {
     size_t n = 0;
-    for (size_t i = 0; i < cols.size(); i++) n += cols[i].type == StrT ? 2 + row[i].text.size() : cols[i].type == RealT ? 8 : 4;
+    for (size_t i = 0; i < cols.size(); i++) n += cols[i].type == StrT ? 2 + row[i].text.size() : cols[i].type == IntT ? 4 : 8;
     return n;
 }
 

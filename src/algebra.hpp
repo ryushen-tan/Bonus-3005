@@ -3,8 +3,9 @@
 #include "parser.hpp"
 #include <functional>
 
-enum Type { Any, IntT, RealT, StrT };
-const char* const TYPE[] = {"any", "number", "number", "string"};
+// BigT is a 64 bit integer, only ever the result of SUM
+enum Type { Any, IntT, RealT, StrT, BigT };
+const char* const TYPE[] = {"any", "number", "number", "string", "number"};
 inline bool comparable(Type a, Type b) { return a == Any || b == Any || (a == StrT) == (b == StrT); }
 // length is the n of VARCHAR(n), 0 for the other types
 struct Col { std::string rel, name; Type type; int length = 0; };

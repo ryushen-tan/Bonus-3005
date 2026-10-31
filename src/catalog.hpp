@@ -16,7 +16,7 @@ struct Table {
     uint32_t file = 0;
 };
 
-inline std::string typeName(const Col& c) { return c.type == StrT ? "VARCHAR(" + std::to_string(c.length) + ")" : c.type == RealT ? "REAL" : "INT"; }
+inline std::string typeName(const Col& c) { return c.type == StrT ? "VARCHAR(" + std::to_string(c.length) + ")" : c.type == RealT ? "REAL" : c.type == BigT ? "BIGINT" : "INT"; }
 
 // one schema per kind of catalog record; the first field of every record is its kind
 enum RecordKind { TableRecord = 1, ColumnRecord, TableStatsRecord, ColumnStatsRecord, BucketRecord };

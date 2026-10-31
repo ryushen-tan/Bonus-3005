@@ -59,13 +59,13 @@ struct JsonParser {
                 expect(':');
                 j.fields.emplace_back(key, value());
             } while (accept(','));
-            expect('}');
+            if (!accept('}')) fail("',' or '}'");
         }
         else if (c == '[') {
             j.kind = Json::Array; i++;
             if (accept(']')) return j;
             do j.items.push_back(value()); while (accept(','));
-            expect(']');
+            if (!accept(']')) fail("',' or ']'");
         }
         else if (c == '"') { j.kind = Json::String; j.text = string(); }
         else if (c == '-' || dig(c)) { j.kind = Json::Number; j.text = number(); }

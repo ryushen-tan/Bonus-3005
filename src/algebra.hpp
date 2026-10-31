@@ -10,6 +10,7 @@ inline bool comparable(Type a, Type b) { return a == Any || b == Any || (a == St
 // length is the n of VARCHAR(n), 0 for the other types
 struct Col { std::string rel, name; Type type; int length = 0; };
 inline std::string qualified(const Col& c) { return c.rel.empty() ? c.name : c.rel + "." + c.name; }
+inline std::string typeName(const Col& c) { return c.type == StrT ? "VARCHAR(" + std::to_string(c.length) + ")" : c.type == RealT ? "REAL" : c.type == BigT ? "BIGINT" : "INT"; }
 using Row = std::vector<Value>;
 struct Rel { std::vector<Col> cols; std::vector<Row> rows; };
 

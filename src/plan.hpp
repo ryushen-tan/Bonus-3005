@@ -1,6 +1,7 @@
 // physical plan JSON: checking it against the schema, building the operator tree, and the exec tool
 #pragma once
 #include "exec.hpp"
+#include "logical.hpp"
 #include "storage.hpp"
 #include <chrono>
 
@@ -60,12 +61,6 @@ inline void validatePlan(const Json& j, const std::string& path) {
 }
 
 inline Node attrNode(const std::string& text) { return mk(Attr, Token{Word, text, 1, 1}); }
-inline std::string aggregateName(const std::string& func, const std::string& column) {
-    if (column == "*") return func + "_star";
-    std::string name = func + "_" + column;
-    std::replace(name.begin(), name.end(), '.', '_');
-    return name;
-}
 // the wider of two union compatible column types, which the output of a set operation takes
 inline Col widerColumn(Col a, const Col& b) {
     if (a.type == StrT) a.length = std::max(a.length, b.length);

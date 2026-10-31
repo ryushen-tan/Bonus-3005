@@ -2,8 +2,8 @@
 #pragma once
 #include "algebra.hpp"
 #include "disk.hpp"
+#include <charconv>
 #include <cmath>
-#include <cstdio>
 #include <string_view>
 
 inline uint16_t get16(const uint8_t* p) { return uint16_t(p[0] | p[1] << 8); }
@@ -14,11 +14,26 @@ inline void put32(uint8_t* p, uint32_t v) { for (int i = 0; i < 4; i++) p[i] = u
 // a record is its fields in schema order: INT as 4 bytes, VARCHAR as a 2 byte length then the bytes;
 // in temporary files only, REAL (an AVG) as the 8 bytes of a double and BIGINT (a SUM) as 8 bytes
 inline Value intValue(long long i) { return {true, double(i), std::to_string(i)}; }
-// four places with halves away from zero, as PostgreSQL's round(): %.4f alone takes 1/32 to 0.0312
+// four places with halves away from zero, as PostgreSQL's round(), taken from the shortest decimal that reads
+// back as d: an AVG of 34153 / 800 is the double nearest 42.69125, a little below it, which %.4f prints as 42.6912
 inline Value realValue(double d) {
-    double rounded = std::round(d * 10000) / 10000;
-    char text[64];
-    std::snprintf(text, sizeof text, "%.4f", rounded == 0 ? 0.0 : rounded);
+    char shortest[400];
+    std::string text(shortest, std::to_chars(shortest, shortest + sizeof shortest, std::fabs(d), std::chars_format::fixed).ptr);
+    size_t point = text.find('.');
+    if (point == std::string::npos) {
+        point = text.size();
+        text += '.';
+    }
+    text.append(5, '0');
+    bool carry = text[point + 5] >= '5';
+    text.resize(point + 5);
+    for (size_t i = text.size(); carry && i-- > 0;) {
+        if (text[i] == '.') continue;
+        carry = text[i] == '9';
+        text[i] = carry ? '0' : char(text[i] + 1);
+    }
+    if (carry) text.insert(0, "1");
+    if (d < 0 && text.find_first_not_of("0.") != std::string::npos) text.insert(0, "-");
     return {true, d, text};
 }
 inline void encodeInto(std::string& out, const std::vector<Col>& cols, const Row& row) {

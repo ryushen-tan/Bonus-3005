@@ -210,7 +210,8 @@ including the "other grouping gives a different answer" checks for cases 10 to 1
   Second, a parse tree may be at most 500 levels of nesting and 2000 levels in all. A chain of `and`s
   or `or`s counts as one level of nesting, so a 2000-term condition is "condition too long". A chain of
   499 `union`s parses and 500 do not, and each unary operator or `not` adds a level. The SQL front end
-  has its own limits, in GRAMMAR_SQL.md §5, and a plan file may nest at most 1000 levels deep.
+  has its own limits, in GRAMMAR_SQL.md §5, and a plan file may nest as deep as the deepest plan a
+  statement within them can become, 45514 levels.
 - Columns in error positions count bytes, so a multibyte character counts as more than one column.
 
 ## Project 2: the database system
@@ -275,3 +276,15 @@ Known limitations of Project 2:
   each table is a file, so two table names that differ only in case are refused (they would share a
   file on a case-insensitive file system), and no table may be called `catalog`.
 - A plan needs at least 4 frames (`opt plan`, `SET frames`, `db --frames`).
+- A statement may nest at most 450 levels of parentheses, NOT and subqueries, a condition may hold at
+  most 1000 comparisons, a statement at most 1000 set operators, and a FROM clause at most 16 tables
+  (GRAMMAR_SQL.md §5). PostgreSQL has no such limits short of its stack. Within them the optimizer's
+  time grows with the square of the plan's depth: 449 nested blocks of 16 tables each take the shell
+  four minutes.
+- The set operators have one precedence, as the specification says, where PostgreSQL binds INTERSECT
+  tighter: `A UNION B INTERSECT C` is `(A UNION B) INTERSECT C` here (GRAMMAR_SQL.md §3).
+- With rule 7 off (`opt plan --without-rules 7`) a statement that nests blocks each with many conjuncts
+  can make a plan deeper than `exec` reads; with every rule on, as in the shell, none can.
+- AVG is a double, rounded to four places from the shortest decimal that reads back as it. So every
+  exact half prints as PostgreSQL prints it, but an average near 10^9 over hundreds of thousands of rows
+  that is closer to a half than a double can tell apart may print one ten-thousandth away.

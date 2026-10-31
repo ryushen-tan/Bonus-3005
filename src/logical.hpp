@@ -32,7 +32,8 @@ inline std::string aggregateName(const std::string& func, const std::string& col
 
 inline LogicalNode logicalNode(const std::string& op, std::vector<LogicalNode> kids = {}) { LogicalNode n; n.op = op; n.kids = std::move(kids); return n; }
 
-inline Json logicalJson(const LogicalNode& n) {
+// a node's operator and its own fields, without its inputs
+inline Json logicalFields(const LogicalNode& n) {
     Json j = jsonObject();
     j.add("op", jsonString(n.op));
     if (n.op == "scan") j.add("table", jsonString(n.table));
@@ -55,6 +56,10 @@ inline Json logicalJson(const LogicalNode& n) {
         j.add("keys", keys).add("aggregates", aggs);
     }
     if (n.op == "limit") j.add("n", jsonNumber(n.n));
+    return j;
+}
+inline Json logicalJson(const LogicalNode& n) {
+    Json j = logicalFields(n);
     if (n.kids.size() == 1) j.add("child", logicalJson(n.kids[0]));
     if (n.kids.size() == 2) j.add("left", logicalJson(n.kids[0])).add("right", logicalJson(n.kids[1]));
     return j;

@@ -91,7 +91,7 @@ void setup() {
     };
     uint64_t seed = 7;
     auto rnd = [&](int n) { seed = seed * 6364136223846793005ULL + 1442695040888963407ULL; return int((seed >> 33) % uint64_t(n)); };
-    std::vector<std::string> r, s, t, skewL, skewR, sorted8, wide, pairs, ties, nameRows, left8, right8;
+    std::vector<std::string> r, s, t, skewL, skewR, sorted8, wide, pairs, ties, nameRows, left8, right8, split, wideMax, halves;
     const char* names[] = {"ann", "bob", "cy", "dee", "ed"};
     for (int i = 0; i < 3000; i++) r.push_back(std::to_string(i % 1500) + "," + std::to_string(rnd(40)) + "," + names[rnd(5)]);
     for (int i = 0; i < 1200; i++) s.push_back(std::to_string(rnd(50)) + ",c" + std::to_string(rnd(300)));
@@ -108,6 +108,12 @@ void setup() {
     // joined, the five pairs are 4084 to 4088 bytes, and only the first fits on a page with its slot
     for (int i = 0; i < 3; i++) { std::string row = std::to_string(i); for (int c = 0; c < 8; c++) row += "," + std::string(255, 'L'); left8.push_back(row); }
     for (int i = 0; i < 5; i++) { std::string row = std::to_string(i); for (int c = 0; c < 7; c++) row += "," + std::string(255, 'R'); right8.push_back(row + "," + std::string(size_t(219 + i), 'r')); }
+    // 211 pairs whose two strings, put together, are the same 300 bytes
+    for (int i = 45; i < 256; i++) split.push_back(std::string(size_t(i), 'x') + "," + std::string(size_t(300 - i), 'x'));
+    // 50 groups, each of whose 16 VARCHAR(255) maxima makes a group of more than a page
+    for (int i = 0; i < 200; i++) wideMax.push_back(std::to_string(i % 50) + "," + std::string(255, char('a' + i % 26)));
+    // averages of 34153 / 800 = 42.69125 and -42.69125, which as doubles are just below and above the half
+    for (int g = 0; g < 2; g++) for (int i = 0; i < 800; i++) halves.push_back(std::to_string(g) + "," + std::to_string((g ? -1 : 1) * (i < 553 ? 43 : 42)));
     table("R", "a:INT,b:INT,s:VARCHAR(10)", r);
     table("S", "b:INT,c:VARCHAR(12)", s);
     table("T", "b:INT,d:INT", t);
@@ -124,6 +130,9 @@ void setup() {
     for (int i = 1; i <= 8; i++) eight += ",c" + std::to_string(i) + ":VARCHAR(255)";
     table("L8", "id:INT" + eight, left8);
     table("R8", "rid:INT" + eight, right8);
+    table("Split", "a:VARCHAR(255),b:VARCHAR(255)", split);
+    table("WideMax", "g:INT,s:VARCHAR(255)", wideMax);
+    table("Halves", "g:INT,v:INT", halves);
 }
 
 struct Test { const char* name; std::function<std::string()> run; };
@@ -342,6 +351,22 @@ const std::vector<Test> TESTS = {
         }
         return problems;
     }},
+    {"a memory-holding operator over a union_all whose right input nests memory holders runs at B = 4", [] {
+        std::string sortedDistinct = unary("limit", "\"n\":2", unary("sort", "\"keys\":[[\"R.b\",\"asc\"]]", unary("distinct", "\"mode\":\"hash\"", project("[\"R.b\"]", scan("R")))));
+        std::string groupedJoin = project("[\"S.b\"]", unary("group_by", "\"mode\":\"hash\",\"keys\":[\"S.b\"],\"aggregates\":[[\"count\",\"*\"]]", join("nested_loop_join", "S.b = T.b", scan("S"), scan("T"))));
+        std::string joinedJoin = project("[\"R1.b\"]", join("nested_loop_join", "R1.b = T.b", join("nested_loop_join", "R1.b = S1.b", scan("R1"), scan("S1")), scan("T")));
+        std::string problems;
+        for (const std::string& right : {sortedDistinct, groupedJoin, joinedJoin}) {
+            std::string both = binary("union_all", project("[\"T.b\"]", scan("T")), right);
+            for (const std::string& plan : {unary("sort", "\"keys\":[[\"T.b\",\"asc\"]]", both), unary("group_by", "\"mode\":\"hash\",\"keys\":[\"T.b\"],\"aggregates\":[[\"count\",\"*\"]]", both),
+                                            join("nested_loop_join", "R1.b = T.b", scan("R1"), both)}) {
+                Outcome small = runPlan(plan, 4), large = runPlan(plan, 64);
+                if (!small.error.empty() || small.rows.empty() || !sameBag(small.rows, large.rows) || small.peak > 4 || small.held != 0 || small.tempFilesLeft)
+                    problems += plan + "\n  " + (small.error.empty() ? show(small.rows) + " want " + show(large.rows) + " peak " + std::to_string(small.peak) : small.error) + "\n";
+            }
+        }
+        return problems;
+    }},
     {"a group_by with no keys as the inner of a nested loop join is aggregated once, not once per block", [] {
         Outcome o = runPlan(join("nested_loop_join", "R.b < count_star", scan("R"), unary("group_by", "\"mode\":\"sort\",\"keys\":[],\"aggregates\":[[\"count\",\"*\"]]", scan("T"))), 4);
         const Operator& t = *o.root->children[1]->children[0];
@@ -354,32 +379,49 @@ const std::vector<Test> TESTS = {
         std::string got = std::to_string(o.rows.size()) + " rows, T read " + std::to_string(t.counters.io.reads) + o.error;
         return blocks > 1 && got == "3000 rows, T read " + std::to_string(pages + 1) ? "" : got + " " + o.root->notes;
     }},
-    {"hash group_by holds only the keys and the aggregates' state, and never more bytes than its frames", [] {
-        std::string plan = unary("group_by", "\"mode\":\"hash\",\"keys\":[\"Names.g\"],\"aggregates\":[[\"max\",\"Names.name\"],[\"min\",\"Names.name\"]]", scan("Names"));
+    {"hash group_by holds only the keys and the aggregates' state, never more bytes than its frames, and one group while it partitions", [] {
+        std::string sixteen;
+        for (int i = 0; i < 16; i++) sixteen += std::string(i ? "," : "") + "[\"max\",\"WideMax.s\",\"m" + std::to_string(i) + "\"]";
         std::string problems;
-        std::vector<Row> rows;
-        {
-            Database db(DIR, 4);
-            std::unique_ptr<Operator> root = buildPlan(db, parseJson(plan));
-            db.pool.clear();
-            root->open();
-            const HashGrouping& grouping = *dynamic_cast<HashGroupBy&>(*root).grouping;
-            auto check = [&] {
-                size_t bytes = 0;
-                for (const HashGrouping::Entry& e : grouping.entries) {
-                    bytes += SLOT_SIZE + encodedSize(grouping.keySchema, e.key);
-                    for (const AggState& s : e.states) bytes += 8 + 2 + s.extreme.text.size();
-                }
-                if (bytes > size_t(grouping.frames.count() * USABLE_SPACE) && problems.empty())
-                    problems = std::to_string(bytes) + " bytes held in " + std::to_string(grouping.frames.count()) + " frames after " + std::to_string(rows.size()) + " rows\n";
-            };
-            check();
-            Row row;
-            while (root->next(row)) { rows.push_back(row); check(); }
-            root->close();
+        for (const std::string& plan : {unary("group_by", "\"mode\":\"hash\",\"keys\":[\"Names.g\"],\"aggregates\":[[\"max\",\"Names.name\"],[\"min\",\"Names.name\"]]", scan("Names")),
+                                        unary("group_by", "\"mode\":\"hash\",\"keys\":[\"WideMax.g\"],\"aggregates\":[" + sixteen + "]", scan("WideMax"))}) {
+            std::vector<Row> rows;
+            {
+                Database db(DIR, 4);
+                std::unique_ptr<Operator> root = buildPlan(db, parseJson(plan));
+                db.pool.clear();
+                root->open();
+                const HashGrouping& grouping = *dynamic_cast<HashGroupBy&>(*root).grouping;
+                auto check = [&] {
+                    size_t bytes = 0;
+                    for (const HashGrouping::Entry& e : grouping.entries) {
+                        bytes += SLOT_SIZE + encodedSize(grouping.keySchema, e.key);
+                        for (const AggState& s : e.states) bytes += 8 + 2 + s.extreme.text.size();
+                    }
+                    bool partitioning = grouping.frames.count() == 0;
+                    if ((partitioning ? grouping.entries.size() > 1 : bytes > size_t(grouping.frames.count() * USABLE_SPACE)) && problems.empty())
+                        problems = std::to_string(grouping.entries.size()) + " groups of " + std::to_string(bytes) + " bytes held in " + std::to_string(grouping.frames.count()) + " frames after " + std::to_string(rows.size()) + " rows\n";
+                };
+                check();
+                Row row;
+                while (root->next(row)) { rows.push_back(row); check(); }
+                root->close();
+            }
+            Outcome sorted = runPlan(std::string(plan).replace(plan.find("hash"), 4, "sort"), 4);
+            if (rows.empty() || !sameBag(rows, sorted.rows)) problems += show(rows) + " want " + show(sorted.rows) + "\n";
         }
-        Outcome sorted = runPlan(std::string(plan).replace(plan.find("hash"), 4, "sort"), 4);
-        return problems + (rows.size() == 120 && sameBag(rows, sorted.rows) ? "" : show(rows) + " want " + show(sorted.rows));
+        return problems;
+    }},
+    {"hash group_by of groups wider than a page runs at every B, as sort mode does", [] {
+        std::string sixteen, problems;
+        for (int i = 0; i < 16; i++) sixteen += std::string(i ? "," : "") + "[\"max\",\"WideMax.s\",\"m" + std::to_string(i) + "\"]";
+        std::string plan = unary("group_by", "\"mode\":\"hash\",\"keys\":[\"WideMax.g\"],\"aggregates\":[" + sixteen + "]", scan("WideMax"));
+        std::vector<Row> want = runPlan(std::string(plan).replace(plan.find("hash"), 4, "sort"), 4).rows;
+        for (int b : {4, 8, 32}) {
+            Outcome o = runPlan(plan, b);
+            if (!o.error.empty() || o.rows.size() != 50 || !sameBag(o.rows, want) || o.peak > b || o.held != 0 || o.tempFilesLeft) problems += "B=" + std::to_string(b) + " " + show(o.rows, 1) + o.error + "\n";
+        }
+        return problems;
     }},
     {"a set operation of INT and REAL prints its column one way at every B", [] {
         std::string average = project("[\"avg_S1_b\"]", unary("group_by", "\"mode\":\"sort\",\"keys\":[],\"aggregates\":[[\"avg\",\"S1.b\"]]", scan("S1")));
@@ -404,6 +446,27 @@ const std::vector<Test> TESTS = {
         }
         return got;
     }},
+    {"AVG rounds an exact half away from zero though its double is not exact: printed, through a temporary file, and summed again", [] {
+        std::string averages = unary("group_by", "\"mode\":\"sort\",\"keys\":[\"Halves.g\"],\"aggregates\":[[\"avg\",\"Halves.v\",\"a\"]]", scan("Halves"));
+        std::string got = show(runPlan(averages, 4).rows) + "\n" + show(runPlan(binary("intersect", averages, averages), 4).rows) + "\n";
+        for (const char* mode : {"sort", "hash"})
+            got += show(runPlan(unary("group_by", std::string("\"mode\":\"") + mode + "\",\"keys\":[\"Halves.g\"],\"aggregates\":[[\"sum\",\"a\"],[\"avg\",\"a\"]]", averages), 4).rows) + "\n";
+        std::string single = "(0, 42.6913) (1, -42.6913) [2 rows]\n", again = "(0, 42.6913, 42.6913) (1, -42.6913, -42.6913) [2 rows]\n";
+        return got == single + single + again + again ? "" : got;
+    }},
+    {"AVG prints the exact rounding of sum / count for every |sum| < 3000 and count < 3300", [] {
+        std::string first;
+        long long wrong = 0;
+        for (long long count = 1; count < 3300; count++)
+            for (long long sum = -2999; sum < 3000; sum++) {
+                long long tenThousandths = (2 * std::llabs(sum) * 10000 + count) / (2 * count);
+                char exact[32];
+                std::snprintf(exact, sizeof exact, "%s%lld.%04lld", sum < 0 && tenThousandths ? "-" : "", tenThousandths / 10000, tenThousandths % 10000);
+                std::string printed = realValue(double(sum) / double(count)).text;
+                if (printed != exact && wrong++ == 0) first = std::to_string(sum) + " / " + std::to_string(count) + " printed " + printed + ", exactly " + exact;
+            }
+        return wrong ? std::to_string(wrong) + " misrounded, the first " + first : "";
+    }},
     {"group_by in either mode, with and without keys, over a memory-holding input leaves no temporary file", [] {
         std::string joined = join("hash_join", "R.b = S.b", scan("R"), scan("S")), got;
         size_t pairs = oracle(joined).size();
@@ -417,20 +480,21 @@ const std::vector<Test> TESTS = {
             }
         return got;
     }},
-    {"JSON nested more than 1000 deep is an error with its place, and a plan of 900 nested nodes runs", [] {
+    {"JSON nested more than MAX_JSON_DEPTH deep is an error with its place, and a plan of 2000 nested nodes runs", [] {
         std::string node = "{\"op\":\"limit\",\"n\":2,\"child\":", got;
-        std::string deepPlan, deepArray = std::string(50000, '[') + std::string(50000, ']');
-        for (int i = 0; i < 20000; i++) deepPlan += node;
-        deepPlan += scan("R1") + std::string(20000, '}');
+        size_t deeper = MAX_JSON_DEPTH + 1000;
+        std::string deepPlan, deepArray = std::string(deeper, '[') + std::string(deeper, ']');
+        for (size_t i = 0; i < deeper; i++) deepPlan += node;
+        deepPlan += scan("R1") + std::string(deeper, '}');
         for (const std::string* text : {&deepPlan, &deepArray}) {
             try { parseJson(*text); got += "parsed\n"; }
             catch (const Error& e) { got += e.msg + " at " + std::to_string(e.line) + ":" + std::to_string(e.col) + "\n"; }
         }
         std::string plan = scan("R1");
-        for (int i = 0; i < 900; i++) plan = unary("limit", "\"n\":2", plan);
+        for (int i = 0; i < 2000; i++) plan = unary("limit", "\"n\":2", plan);
         got += show(runPlan(plan, 4).rows);
-        std::string tooDeep = "json syntax error: arrays and objects nested more than 1000 deep at 1:";
-        return got == tooDeep + std::to_string(1000 * node.size() + 1) + "\n" + tooDeep + "1001\n(1) (2) [2 rows]" ? "" : got;
+        std::string tooDeep = "json syntax error: arrays and objects nested more than " + std::to_string(MAX_JSON_DEPTH) + " deep at 1:";
+        return got == tooDeep + std::to_string(MAX_JSON_DEPTH * node.size() + 1) + "\n" + tooDeep + std::to_string(MAX_JSON_DEPTH + 1) + "\n(1) (2) [2 rows]" ? "" : got;
     }},
     {"exec trace is a line per node, its four counters then its own fields, and no total line", [] {
         std::ofstream(DIR + "/trace.json") << join("hash_join", "R1.b = S1.b", scan("R1"), scan("S1"));
@@ -442,24 +506,58 @@ const std::vector<Test> TESTS = {
                            "  seqscan S1 tuples_out=3 comparisons=0 reads=2 writes=0\n";
         return out.str() == want ? "" : out.str();
     }},
-    {"hash distinct partitions B - 1 ways, to as many levels as the formula says, with the formula's I/O", [] {
-        long long pages;
-        {
-            Database db(DIR, 4);
-            pages = db.table("SkewL").dataPages;
-        }
+    {"text keys hash by their length and bytes, so ('ab', 'c') and ('a', 'bc') hash apart", [] {
+        Row ab = {textValue("ab"), textValue("c")}, bc = {textValue("a"), textValue("bc")};
+        std::string same;
+        for (uint64_t seed = 1; seed <= 8; seed++) if (hashKey(ab, {0, 1}, seed) == hashKey(bc, {0, 1}, seed)) same += std::to_string(seed) + " ";
+        return same.empty() ? "" : "the same hash for seeds " + same;
+    }},
+    {"every level of hash grouping that partitions does so B - 1 ways and finishes a group, so the levels end however the keys hash", [] {
         std::string problems;
-        for (int b : {4, 5, 8, 16}) {
-            Outcome o = runPlan(unary("distinct", "\"mode\":\"hash\"", scan("SkewL")), b);
-            int work = b - 1, levels = 0;
-            double formula = 0;
-            for (double inputs = 1; double(pages) / inputs > work; inputs *= work, levels++) formula += 2 * work * inputs + 2 * inputs * work * std::ceil(double(pages) / (inputs * work));
-            double io = double(o.root->counters.io.reads + o.root->counters.io.writes);
-            std::string start = "levels=" + std::to_string(levels) + " partitions=" + std::to_string(work) + " ";
-            if (o.root->notes.rfind(start, 0) != 0 || io < formula || io > formula * 1.1 || o.rows.size() != 4000)
-                problems += "B=" + std::to_string(b) + " " + o.root->notes + " io " + std::to_string(io) + " formula " + std::to_string(formula) + " want " + start + "\n";
+        for (int b : {4, 8, 16}) {
+            Database db(DIR, b);
+            Table& split = db.table("Split");
+            SeqScan scan(db, split);
+            ChildSource in(scan);
+            unsigned long long comparisons = 0;
+            HashGrouping grouping(db, split.cols, {0, 1}, {}, comparisons);
+            grouping.plan(db.pool.freeFrames() - 1);
+            grouping.consume(in, 0);
+            size_t groups = 0, levels = 0;
+            for (bool more = true; more; more = grouping.nextPartition()) {
+                bool partitioned = grouping.sizes.size() > levels;
+                if (partitioned && (grouping.entries.empty() || grouping.sizes.size() - levels != size_t(b - 1))) problems += "B=" + std::to_string(b) + " a level wrote " + std::to_string(grouping.sizes.size() - levels) + " partitions and finished " + std::to_string(grouping.entries.size()) + " groups\n";
+                levels = grouping.sizes.size();
+                groups += grouping.entries.size();
+            }
+            if (grouping.levels == 0 || groups != 211) problems += "B=" + std::to_string(b) + " " + grouping.notes() + " " + std::to_string(groups) + " groups\n";
         }
         return problems;
+    }},
+    {"hash distinct and group_by of keys that run into each other finish at every B", [] {
+        std::string problems;
+        for (const std::string& plan : {unary("distinct", "\"mode\":\"hash\"", scan("Split")), unary("group_by", "\"mode\":\"hash\",\"keys\":[\"Split.a\",\"Split.b\"],\"aggregates\":[[\"count\",\"*\"]]", scan("Split"))})
+            for (int b : {4, 8, 16}) {
+                Outcome o = runPlan(plan, b);
+                if (!o.error.empty() || o.rows.size() != 211 || o.peak > b || o.held != 0 || o.tempFilesLeft) problems += "B=" + std::to_string(b) + " " + o.root->notes + o.error + "\n";
+            }
+        return problems;
+    }},
+    {"exec reports an exception that is not an Error on one line", [] {
+        std::string dir = DIR + "-internal";
+        std::filesystem::remove_all(dir);
+        {
+            Database db(dir, 8);
+            Table& t = db.createTable("R", parseSchema("a:INT"));
+            t.stats.analyzed = true;
+            t.stats.columns[0] = {1, textValue("abc"), textValue("abc"), {}};
+            db.saveCatalog();
+        }
+        std::ofstream(dir + "/plan.json") << scan("R");
+        std::ostringstream out;
+        int code = execTool({"run", "--db", dir, "--plan", dir + "/plan.json"}, out);
+        std::filesystem::remove_all(dir);
+        return code == 1 && out.str() == "internal error: stoll: no conversion\n" ? "" : out.str();
     }},
     {"plans that do not conform are rejected naming the node", [] {
         std::string got;
@@ -514,7 +612,7 @@ const std::vector<Test> TESTS = {
     }},
 };
 
-int main() {
+int runTests() {
     setup();
     int fails = 0;
     for (const Test& t : TESTS) {
@@ -528,3 +626,4 @@ int main() {
     std::cout << TESTS.size() - fails << "/" << TESTS.size() << " passed\n";
     return fails != 0;
 }
+int main() { return onLargeStack(std::cout, runTests); }

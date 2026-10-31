@@ -512,3 +512,107 @@ Left as they are, on purpose:
 - Errors still go to standard output, as in Bonus Project 1.
 - The hash join's partitions are uneven for small INT keys. The grouping's new hash finaliser would fix
   that too, but it would move most of REPORT_M2's and REPORT_M4's numbers.
+
+## 2026-10-31, session 16: reviewing the fixes, and fixing them again
+
+Goal: check that session 15's fixes held. Two reviews ran on commit c304e8c: one read the diff and
+reverted each fix to see whether a test failed (86 reversions), and one ran about 9,200 random queries
+through the shell and 2,500 through the tool chain against PostgreSQL 17 at B = 4, 7 and 32. Every
+finding was reproduced twice. The two parts were then fixed separately and merged.
+
+AI issues in session 15's fixes:
+1. **Hash grouping could run forever.** The rewrite sent the whole table and every later tuple to
+   partitions as soon as the table overflowed, so a level was not sure to finish any group. The
+   key hash joined VARCHAR fields with no length, so ('ab','c') and ('a','bc') hashed alike at every
+   level. That collision was older and had been harmless while each round emitted its table. A hash
+   DISTINCT of 211 such pairs grew its temporary file at about 200 MB/s. The review found it in the code
+   and reproduced it with keys that always collide.
+2. **Hash GROUP BY of wide aggregates failed.** The partitions held group states, so 16 MAX over a
+   VARCHAR(255) made a 4244-byte record: "does not fit on a page". The old code, which partitioned input
+   tuples, returned 50 rows. Found from how a partition record is built.
+3. **One missing table file made the whole database unusable**, and `SET frames` then segfaulted.
+   Session 15 made opening a missing file an error and the catalog opened every table's file. The shell
+   had always dropped its database before building the new one; with the reopen now throwing, the next
+   statement used a null database. Found by deleting one table's file mid-session.
+4. **The JSON depth limit was below the SQL limits.** The execution fix set 1000 levels, and the SQL
+   fix allowed 1000 set operators and 450 nested subqueries, in the same session. The shell ran 1000
+   UNION ALLs, but `opt plan` refused the compiled plan. Both limits had only been tried in the -O2
+   build on the 8 MB main stack; the sanitizer build overflowed that stack at 300 nested subqueries.
+5. **AVG still misrounded some halves.** `std::round(d * 10000)` fixed halves that are exact in binary,
+   such as 1/32, but 34153 / 800 = 42.69125 is a double a little below the half, so it printed 42.6912
+   where PostgreSQL prints 42.6913. Session 15's entry said AVG rounds a half away from zero; that held
+   only for exact quotients. Found by reading the rounding code and then checking real data: 10 windows
+   of 800 Emp rows hit it.
+6. **The cost model and the executor disagreed again.** The executor's keyless group_by stopped holding
+   memory, but the new `memoryBelow` treated every group_by as a holder, so a DISTINCT below `COUNT(*)`
+   was estimated at 1534 page I/Os and did 904. `hashCost` sized groups by average width over 4096-byte
+   pages, the executor by declared length plus slot over 4088 bytes: one plan was estimated at 9 and did
+   152, where sorting does 28.
+7. **A failed page read left a frame half evicted**, written back and unmapped but still marked used.
+   `readPage` now throws past the end of a file, which session 15 added; the frame code was older.
+8. **The catalog's new atomic save set 0644 on catalog.db**, whatever the umask, while table files follow
+   it.
+9. **Five fixes had no test that failed without them:** rule 5 resolving names in the group_by's output
+   (the merge bug of session 15, 0 rows instead of 6), the hash cost loop, the B − 1 frames of a lower
+   join, the `internal error:` handlers, and the type of SUM over a REAL. A test recomputing a formula
+   passed whatever the optimizer did.
+
+Older problems the reviews found:
+- **Some plans failed at B = 4.** A sort, distinct, group_by or join over a UNION ALL whose right input
+  holds two memory users wanted 5 frames: `UnionAll` opened its right input only after the parent had
+  taken its output frame. The random queries hit it in 116 shell runs and 25 tool-chain runs, all at
+  B = 4.
+- `opt explain` and EXPLAIN padded their columns; the specification shows single spaces. Session 14 had
+  removed the same padding from `exec trace` only.
+- `(SELECT ...) ORDER BY eid` refused a FROM column, because a lone parenthesised query took the set
+  operation path. An INT literal over 11 characters (`000000000001`) was a type error. `sql check`
+  accepted table names the catalog refuses. Rule 3 could merge ON and WHERE into a condition longer
+  than the limit, reported in Bonus 1's format at line 1, column 1. The ANALYZE frames message's
+  arithmetic did not match the number it asked for.
+- While fixing the depth limits: a FROM clause of 32 tables crashed the optimizer and 33 or more gave
+  wrong counts, because the join enumeration keeps its subsets in 32-bit masks.
+
+What changed:
+- **Execution.** Text keys hash as their length and bytes. Hash grouping gives its table all W frames;
+  on the first group that does not fit it reads its input again and splits it W ways, aggregating the
+  first group of the pass as it goes, so every level finishes a group. Partitions hold input tuples cut
+  down to the columns the grouping reads. A union_all under a parent that writes its output copies a
+  right input that holds memory to its own file before it opens its left. A missing file is an error
+  for that table only. A frame is emptied before a page is read into it. catalog.db follows the umask.
+- **AVG.** The reviewer's version took any value within two units in the last place of a half as the
+  half. I replaced it while merging: the value is rounded from the shortest decimal that reads back as
+  the double. On 415,599 averages checked against exact fractions, both got all 19,715 exact halves
+  right; the tolerance misrounded 533 others and the shortest decimal 70, all averages near 10^9 closer
+  to a half than a double resolves (README lists this).
+- **Cost.** A keyless group_by holds no memory in the optimizer either. `hashCost` counts groups and
+  partition pages as Module 2 packs them. The Works DISTINCT is now estimated at 1092 and does 1023; the
+  wide MAX query picks sort, estimated 27, actual 28.
+- **SQL, optimizer and shell.** The plan depth `MAX_JSON_DEPTH` is computed from the SQL limits, and a
+  FROM clause holds at most 16 tables. exec, opt, sql and the shell run on a thread with a 1 GB stack.
+  The physical plan writer no longer re-serialises every subtree. INT literals are judged by value.
+  `sql check` uses the catalog's own name rule. Rule 3 and the join enumeration split a merged
+  condition into pieces that fit. `explain` uses single spaces. A lone parenthesised query is the query
+  inside it. `SET frames` builds the new database before dropping the old one.
+
+Verification:
+- **Tests:** 305 grew to 340 (Bonus 1 124, storage 47, execution 39, SQL 99, optimizer and shell 31).
+  All pass, also under AddressSanitizer and UndefinedBehaviorSanitizer. Each new test was checked to fail
+  with its fix reverted.
+- **End to end:** 390 of 390 runs agree with PostgreSQL at scale 1 and 390 of 390 at scale 5.
+- **Random queries:** the review's recorded queries, rerun through the shell against PostgreSQL: 1346
+  runs at scale 1 (B = 4 and 32) and 384 at scale 5 (B = 4). No result differs and no plan is refused
+  at B = 4; over all six recorded sets, the refusals at B = 4 went from 116 to 0. What is left is the specification's error for SUM, AVG, MIN or MAX of an
+  empty input inside a subquery (22 runs), and one query that sorts a 75-million-row cross product,
+  which the check's 512 MB file cap stopped as it stopped the review's run.
+- **Measurements:** perf/m1.py reproduces REPORT_M1 exactly. perf/m2.py changes §6 and §7 of REPORT_M2,
+  which were updated from it (B = 16: 268 reads and 169 writes). perf/m4.py changes only the explain
+  blocks' spacing; no number in REPORT_M4 moved.
+
+Left as they are, on purpose:
+- Set operators keep the specification's single precedence; PostgreSQL binds INTERSECT tighter.
+- The optimizer's time grows with the square of a plan's depth, so the deepest allowed statements take
+  minutes. Pretty-printed plans of that depth are gigabytes.
+- The hash grouping estimate is within 10% except near a level boundary, where uneven partitions make
+  it up to about 30% off.
+- `sql check` does not catch two CREATE TABLEs in one script whose names differ only in case; the shell
+  does.

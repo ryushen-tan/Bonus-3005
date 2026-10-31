@@ -36,6 +36,12 @@ std::string nestedSubqueries(int n) {
 }
 // the column just after the text before it, ending an error line
 std::string columnAfter(const std::string& before) { return std::to_string(before.size() + 1) + "\n"; }
+// a FROM clause of n tables, Dept d1, Dept d2, ..., the first of them inner when it is given
+std::string tablesFrom(int n, const std::string& inner = "") {
+    std::string s = " FROM " + (inner.empty() ? "Dept d1" : "(" + inner + ") AS d1");
+    for (int i = 2; i <= n; i++) s += ", Dept d" + std::to_string(i);
+    return s;
+}
 
 struct Case { const char* name; std::string sql; std::string want; bool json = false; };
 const std::vector<Case> CASES = {
@@ -88,6 +94,8 @@ const std::vector<Case> CASES = {
      "project [Emp.name]\n  select (Emp.age = 1 or Emp.age = 2) and not (Emp.did = 3 and Emp.city = 'x')\n    scan Emp\n"},
     {"set operators are left associative", "SELECT city FROM Emp UNION SELECT city FROM Dept EXCEPT SELECT name FROM Proj;",
      "except\n  union\n    project [Emp.city]\n      scan Emp\n    project [Dept.city]\n      scan Dept\n  project [Proj.name]\n    scan Proj\n"},
+    {"INTERSECT has the precedence of UNION, unlike in PostgreSQL", "SELECT city FROM Emp UNION SELECT city FROM Dept INTERSECT SELECT place FROM Loc;",
+     "intersect\n  union\n    project [Emp.city]\n      scan Emp\n    project [Dept.city]\n      scan Dept\n  project [Loc.place]\n    scan Loc\n"},
     {"parentheses change the grouping of set operators", "SELECT city FROM Emp UNION (SELECT city FROM Dept EXCEPT SELECT name FROM Proj);",
      "union\n  project [Emp.city]\n    scan Emp\n  except\n    project [Dept.city]\n      scan Dept\n    project [Proj.name]\n      scan Proj\n"},
     {"ORDER BY and LIMIT after a set operation apply to all of it", "SELECT city FROM Emp UNION SELECT city FROM Dept ORDER BY city DESC LIMIT 2;",
@@ -117,7 +125,10 @@ const std::vector<Case> CASES = {
      "{\"statement\":\"create_table\",\"table\":\"Pet\",\"columns\":[[\"id\",\"INT\"],[\"kind\",\"VARCHAR\",5]]}\n{\"statement\":\"insert\",\"table\":\"Pet\",\"values\":[1,\"cat\"]}\nproject [Pet.kind]\n  scan Pet\n"},
     {"INSERT with a value of the wrong type", "INSERT INTO Dept VALUES (1, 'a', 'b', 'c');", "error: type: column budget is INT but the value 'b' is a string at line 1, column 34\n"},
     {"INSERT with a string too long", "CREATE TABLE P (k VARCHAR(2)); INSERT INTO P VALUES ('abc');", "error: type: 'abc' is longer than VARCHAR(2) at line 1, column 54\n"},
-    {"CREATE of a table that exists", "CREATE TABLE Emp (a INT);", "error: name: table Emp already exists at line 1, column 1\n"},
+    {"CREATE of a table that exists", "CREATE TABLE Emp (a INT);", "error: name: table Emp already exists at line 1, column 14\n"},
+    {"CREATE of a table called catalog, in any case", "CREATE TABLE Catalog (a INT);", "error: name: table name Catalog is taken by the catalog's own file, catalog.db at line 1, column 14\n"},
+    {"CREATE of a table whose name differs from an existing one only in case", "SELECT did FROM Dept;\nCREATE  TABLE dept (a INT);",
+     "error: name: table dept would share a file with table Dept: table names may not differ only in case at line 2, column 15\n"},
 
     // long and deep statements
     {"a chain of 1000 ORs is one level of nesting", "SELECT COUNT(*) FROM Emp WHERE " + chain("eid", "OR", 1000) + ";",
@@ -136,6 +147,8 @@ const std::vector<Case> CASES = {
     {"450 parentheses around a query", repeated("(", 450) + "SELECT eid FROM Emp" + repeated(")", 450) + ";", "project [Emp.eid]\n  scan Emp\n"},
     {"451 nested subqueries are too deep", nestedSubqueries(451),
      "error: syntax: nesting too deep, at most 450 levels of parentheses, NOT and subqueries at line 1, column " + columnAfter(nestedSubqueries(451).substr(0, nestedSubqueries(451).find("SELECT did FROM Emp")))},
+    {"17 tables in one FROM clause are too many", "SELECT COUNT(*)" + tablesFrom(17) + ";",
+     "error: syntax: a FROM clause may name at most 16 tables at line 1, column " + columnAfter("SELECT COUNT(*)" + tablesFrom(16) + ", ")},
     {"1001 set operators are an error, not a crash", "SELECT did FROM Emp" + repeated(" UNION ALL SELECT did FROM Emp", 1001) + ";",
      "error: syntax: a statement may hold at most 1000 set operators at line 1, column " + columnAfter("SELECT did FROM Emp" + repeated(" UNION ALL SELECT did FROM Emp", 1000) + " ")},
 
@@ -183,12 +196,28 @@ const std::vector<Case> CASES = {
      "project [Emp.name]\n  select Emp.age > 1\n    scan Emp\n{\"statement\":\"insert\",\"table\":\"Proj\",\"values\":[2,-3,\"x\"]}\n"},
     {"an integer too big for an INT says why", "SELECT name FROM Emp WHERE age < 3000000000;",
      "error: type: 3000000000 does not fit in an INT, which has 4 bytes and holds -2147483648 to 2147483647 at line 1, column 34\n"},
+    {"an integer is judged by its value, leading zeros and all", "SELECT name FROM Emp WHERE age = 000000000030; INSERT INTO Proj VALUES (00000000000002, -000000000003, 'x');",
+     "project [Emp.name]\n  select Emp.age = 000000000030\n    scan Emp\n{\"statement\":\"insert\",\"table\":\"Proj\",\"values\":[2,-3,\"x\"]}\n"},
+    {"an integer past the range of a long long is too big for an INT", "SELECT name FROM Emp WHERE age < 99999999999999999999;",
+     "error: type: 99999999999999999999 does not fit in an INT, which has 4 bytes and holds -2147483648 to 2147483647 at line 1, column 34\n"},
 
     // LIMIT inside a set operation and a subquery
     {"LIMIT in a parenthesised set operand", "SELECT title FROM Dept UNION ALL (SELECT name FROM Emp ORDER BY name LIMIT 2);",
      "union_all\n  project [Dept.title]\n    scan Dept\n  limit 2\n    sort [Emp.name asc]\n      project [Emp.name]\n        scan Emp\n"},
     {"LIMIT in a subquery in FROM", "SELECT s.did, d.title FROM (SELECT did FROM Emp ORDER BY did DESC LIMIT 2) AS s JOIN Dept d ON s.did = d.did;",
      "project [s.did, d.title]\n  join s.did = d.did\n    rename s\n      limit 2\n        sort [Emp.did desc]\n          project [Emp.did]\n            scan Emp\n    rename d\n      scan Dept\n"},
+
+    // a parenthesised query on its own is that query, as in PostgreSQL
+    {"ORDER BY after a parenthesised block may name a FROM column", "(SELECT name FROM Emp WHERE eid < 3) ORDER BY eid;",
+     "project [Emp.name]\n  sort [Emp.eid asc]\n    project [Emp.name, Emp.eid]\n      select Emp.eid < 3\n        scan Emp\n"},
+    {"ORDER BY and LIMIT after a parenthesised block in FROM", "SELECT * FROM ((SELECT name FROM Emp WHERE eid < 5) ORDER BY eid DESC LIMIT 2) t;",
+     "project [t.name]\n  rename t\n    limit 2\n      project [Emp.name]\n        sort [Emp.eid desc]\n          project [Emp.name, Emp.eid]\n            select Emp.eid < 5\n              scan Emp\n"},
+    {"a LIMIT inside the parentheses and an ORDER BY after them sort before they cut", "((SELECT name FROM Emp LIMIT 2)) ORDER BY eid;",
+     "limit 2\n  project [Emp.name]\n    sort [Emp.eid asc]\n      project [Emp.name, Emp.eid]\n        scan Emp\n"},
+    {"a parenthesised block cannot have a second ORDER BY", "(SELECT name FROM Emp ORDER BY name) ORDER BY eid;", "error: syntax: multiple ORDER BY clauses are not allowed at line 1, column 38\n"},
+    {"a parenthesised block cannot have a second LIMIT", "((SELECT name FROM Emp LIMIT 2)) LIMIT 1;", "error: syntax: multiple LIMIT clauses are not allowed at line 1, column 34\n"},
+    {"ORDER BY after a parenthesised set operation names the result's columns only", "(SELECT name FROM Emp UNION SELECT title FROM Dept) ORDER BY eid;",
+     "error: name: ORDER BY eid is not a column of the result at line 1, column 62\n"},
 };
 
 int main() {
@@ -204,6 +233,10 @@ int main() {
     // check prints nothing and exits 0 when there is no error, and exits 1 with the error otherwise
     total++;
     if (checkCode("SELECT name FROM Emp;") != 0 || checkCode("SELECT nope FROM Emp;") != 1) { fails++; std::cout << "FAIL check exit codes\n"; }
+    total++;
+    if (checkCode("SELECT COUNT(*)" + tablesFrom(16, "SELECT d1.did" + tablesFrom(16)) + ";") != 0) { fails++; std::cout << "FAIL 16 tables in FROM, one a subquery of 16 tables\n"; }
+    total++;
+    if (checkCode("CREATE TABLE catalog (x INT);") != 1 || checkCode("CREATE TABLE dept (x INT);") != 1) { fails++; std::cout << "FAIL check refuses the table names the catalog refuses\n"; }
     total++;
     std::string tree = run({"parse", "--query", "SELECT DISTINCT e.name AS n FROM Emp e JOIN (SELECT did FROM Dept) AS d ON e.did = d.did WHERE NOT e.age > 3 GROUP BY e.name ORDER BY n LIMIT 2", "--explain"});
     std::string wantTree = "query\n  select distinct\n    column e.name as n\n  from\n    table Emp as e\n    join on e.did = d.did\n      subquery as d\n        query\n          select\n            column did\n          from\n            table Dept\n"

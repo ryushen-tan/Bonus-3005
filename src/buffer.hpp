@@ -18,7 +18,8 @@ struct BufferPool {
     unsigned long long accesses = 0, hits = 0, misses = 0, evictions = 0;
     int held = 0, peak = 0;
 
-    // every tool's --frames B ends up here, so this is the one check of it
+    // every tool's --frames B ends up here, so this is the one check that B is at least 1. opt and the shell
+    // also refuse less than the 4 frames a plan needs
     BufferPool(DiskManager& d, int frameCount, Policy p) : disk(d), policy(p), frames(size_t(frameCount)) {
         if (frameCount < 1) throw Error{"error: --frames must be at least 1"};
     }
@@ -42,14 +43,23 @@ struct BufferPool {
             if (swept > 2 * frames.size()) return NONE;
         }
     }
-    size_t takeFrame() {
+    size_t victim() {
         size_t v = chooseVictim();
         if (v == NONE) throw Error{"error: no unpinned frame available, all " + std::to_string(frames.size()) + " frames are pinned"};
+        return v;
+    }
+    // writes the frame's page back if it is dirty and drops it from the page table, so the frame holds no page
+    // even when what is read into it next fails
+    void empty(size_t v) {
         Frame& f = frames[v];
-        if (f.used) {
-            if (f.dirty) disk.writePage(f.id, f.data.data());
-            table.erase(f.id);
-        }
+        if (!f.used) return;
+        if (f.dirty) disk.writePage(f.id, f.data.data());
+        table.erase(f.id);
+        f.used = f.dirty = false;
+    }
+    size_t takeFrame() {
+        size_t v = victim();
+        empty(v);
         return v;
     }
     void hold() { peak = std::max(peak, ++held); }
@@ -71,9 +81,11 @@ struct BufferPool {
             hits++;
             return f.data.data();
         }
-        size_t v = takeFrame();
-        if (frames[v].used) evictions++;
+        size_t v = victim();
+        bool replaced = frames[v].used;
+        empty(v);
         disk.readPage(id, frames[v].data.data());
+        if (replaced) evictions++;
         misses++;
         loaded(v, id, false);
         return frames[v].data.data();
@@ -101,8 +113,8 @@ struct BufferPool {
 
     size_t reserve() {
         size_t v = takeFrame();
-        Frame& f = frames[v];
-        f.used = false; f.reserved = true; f.dirty = false; f.pins = 1;
+        frames[v].reserved = true;
+        frames[v].pins = 1;
         hold();
         return v;
     }

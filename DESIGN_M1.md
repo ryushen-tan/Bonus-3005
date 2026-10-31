@@ -12,11 +12,14 @@ page id the module document talks about. Every multi-byte integer is little-endi
 
 A table's file is made only when the table is created (`storage create-table` or SQL's CREATE TABLE),
 and never over a file that is already there. Everything else opens a file only if it exists, so a
-missing `R.db` is an error, not a new empty table. Reading a page past the end of a file is an error
-too, so a file cut short cannot be read as zeros. Likewise only `create-table` (and the shell) makes a
-new database: `load`, `scan` and `layout` on a directory without a `catalog.db` say it is not a
-database. The `storage` tool reports every error on one line with exit status 1, and an exception that
-is not one of the engine's own errors as `internal error: ...`, never by aborting.
+missing `R.db` is an error, not a new empty table. The error is given when the file is first read or
+written, not when the catalog is read, so a database with one missing table file still has its other
+tables: a scan, a load or a new table elsewhere works, and any command on that table says `io error:
+cannot open D/R.db: No such file or directory`. Reading a page past the end of a file is an error too,
+so a file cut short cannot be read as zeros. Likewise only `create-table` (and the shell) makes a new
+database: `load`, `scan` and `layout` on a directory without a `catalog.db` say it is not a database.
+The `storage` tool reports every error on one line with exit status 1, and an exception that is not one
+of the engine's own errors as `internal error: ...`, never by aborting.
 
 The disk manager counts one read per `readPage` and one write per `writePage`, in a total and, when the
 executor has set it, in the counters of the operator that is running (Module 2 uses that to charge each
@@ -158,11 +161,17 @@ Victim choice. An empty frame is always used first, lowest index first. After th
 
 Evicting a pinned page cannot happen: neither policy will choose a frame with a pin, and when there is
 no unpinned frame `fetch` fails with `no unpinned frame available`. Unpinning a page that is not
-resident, or whose pin count is already 0, is an error. Both have tests, under both policies.
+resident, or whose pin count is already 0, is an error. Both have tests, under both policies. A victim
+is emptied before anything is read into its frame: its page is written back if dirty and dropped from
+the page table. So when the read then fails (a page past the end of a file, a missing file), the frame
+is left empty and clean, not claiming a page the table no longer maps, and no miss or eviction is
+counted.
 
 A pool needs at least one frame. Every tool's `--frames` B becomes the size of a pool, so the pool's
-constructor is the one place that checks it, with one message, `--frames must be at least 1`. CLOCK is
-the default policy, for the reasons in section 2 of REPORT_M1.md; `--policy lru` selects LRU.
+constructor is the one place that checks B ≥ 1, with one message, `--frames must be at least 1`. `opt`
+and the shell check a stricter bound of their own, B ≥ 4, the least a plan needs (section 4 of
+DESIGN_M4.md). CLOCK is the default policy, for the reasons in section 2 of REPORT_M1.md; `--policy lru`
+selects LRU.
 
 Two additions that the later modules need:
 
@@ -213,9 +222,11 @@ kind 1       "R"       "R.db"             1 data page   3 tuples
 When the catalog changes (create-table, load, ANALYZE, an INSERT in the shell) it is written whole to a
 new temporary file in the database directory, flushed, and renamed over `catalog.db`. A rename replaces
 the file in one step, so a process killed at any moment leaves the old catalog or the new one, never
-part of either. A save that fails deletes its temporary file, and a `create-table` whose save fails also
-deletes the table file it made, so the name can be used again. The catalog is small, the rewrite is
-deterministic, and it means running ANALYZE twice produces a byte-identical `catalog.db`.
+part of either. The temporary file is made 0600, so before the rename it gets the mode every other file
+is created with, 0644 less the umask: under umask 077 `catalog.db` is 0600 like the table files. A save
+that fails deletes its temporary file, and a `create-table` whose save fails also deletes the table file
+it made, so the name can be used again. The catalog is small, the rewrite is deterministic, and it means
+running ANALYZE twice produces a byte-identical `catalog.db`.
 
 ## 7 Loading
 

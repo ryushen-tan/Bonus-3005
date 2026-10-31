@@ -116,6 +116,8 @@ struct ColumnDef { std::string name; bool varchar = false; int length = 0; int l
 struct Statement {
     enum { Create, Insert, Select } kind;
     std::string table;
+    // where CREATE TABLE names its table
+    int nameLine = 0, nameCol = 0;
     std::vector<ColumnDef> columns;
     std::vector<SqlOperand> values;
     std::shared_ptr<Query> query;
@@ -125,8 +127,19 @@ struct Statement {
 // ---- the parser, one method per rule of GRAMMAR_SQL.md ----
 
 // the most a statement may hold, so that the recursive parts of the system stay within the stack: levels of
-// parentheses, NOT and subqueries together, comparisons in one condition, and set operators
-const int MAX_NESTING = 450, MAX_COMPARISONS = 1000, MAX_SET_OPERATORS = 1000;
+// parentheses, NOT and subqueries together, comparisons in one condition, and set operators. The optimizer
+// orders the tables of a FROM clause by trying every subset of them, so the tables are limited too
+const int MAX_NESTING = 450, MAX_COMPARISONS = 1000, MAX_SET_OPERATORS = 1000, MAX_TABLES = 16;
+// The deepest plan those limits allow, the optimizer's rewrites included (GRAMMAR_SQL.md section 5). A path from
+// the root meets each set operator at most once, and at most MAX_NESTING + 1 query blocks, nested in each other.
+// A block adds at most three levels per table, a join, the projection rule 6 puts on its input and a filter split
+// off a condition too tall to be one, and BLOCK_LEVELS others. With rule 7 off every conjunct is a filter of its
+// own, and room is left for the conjuncts of one block's WHERE, HAVING and ON conditions
+const int BLOCK_LEVELS = 13;
+const int MAX_PLAN_DEPTH = MAX_SET_OPERATORS + (MAX_NESTING + 1) * (BLOCK_LEVELS + 3 * MAX_TABLES) + (MAX_TABLES + 1) * MAX_COMPARISONS;
+// a plan nests one object per node, a node at most two arrays (a sort's keys), and sql compile writes the plans of
+// a script with several statements in one more array
+const int MAX_JSON_DEPTH = MAX_PLAN_DEPTH + 3;
 
 struct SqlParser {
     std::vector<SqlToken> toks;
@@ -165,7 +178,8 @@ struct SqlParser {
         if (accept("CREATE")) {
             s.kind = Statement::Create;
             expect("TABLE");
-            s.table = ident("a table name").text;
+            SqlToken name = ident("a table name");
+            s.table = name.text; s.nameLine = name.line; s.nameCol = name.col;
             expect("(");
             do s.columns.push_back(columnDef()); while (accept(","));
             expect(")");
@@ -202,7 +216,8 @@ struct SqlParser {
         return c;
     }
     // set operators are all left associative at one level of precedence; ORDER BY and LIMIT after the
-    // last term apply to the whole query, as in PostgreSQL
+    // last term apply to the whole query, as in PostgreSQL. A parenthesised query on its own is that query, so
+    // ORDER BY and LIMIT after it apply as if written inside the parentheses, and only one of each may be written
     std::shared_ptr<Query> query() {
         auto q = std::make_shared<Query>();
         q->line = cur().line; q->col = cur().col;
@@ -218,7 +233,10 @@ struct SqlParser {
             q->ops.push_back(op);
             q->terms.push_back(term());
         }
-        if (accept("ORDER")) {
+        if (q->terms.size() == 1 && q->terms[0].paren) q = q->terms[0].paren;
+        if (at("ORDER")) {
+            SqlToken order = take();
+            if (!q->orderBy.empty()) throw SqlError{"syntax", "multiple ORDER BY clauses are not allowed", order.line, order.col};
             expect("BY");
             do {
                 OrderItem o;
@@ -228,7 +246,9 @@ struct SqlParser {
                 q->orderBy.push_back(o);
             } while (accept(","));
         }
-        if (accept("LIMIT")) {
+        if (at("LIMIT")) {
+            SqlToken limit = take();
+            if (q->limit >= 0) throw SqlError{"syntax", "multiple LIMIT clauses are not allowed", limit.line, limit.col};
             if (cur().kind != IntegerToken || cur().text[0] == '-' || cur().text.size() > 18) fail("a non-negative number of rows");
             q->limit = std::stoll(take().text);
         }
@@ -248,7 +268,8 @@ struct SqlParser {
         if (accept("*")) b->star = true;
         else do b->items.push_back(selectItem()); while (accept(","));
         expect("FROM");
-        do b->from.push_back(joinChain()); while (accept(","));
+        int tables = 0;
+        do b->from.push_back(joinChain(tables)); while (accept(","));
         if (accept("WHERE")) b->where = std::make_unique<Condition>(clause());
         if (accept("GROUP")) {
             expect("BY");
@@ -284,18 +305,20 @@ struct SqlParser {
         if (accept(".")) { c.qualifier = first.text; c.name = ident("a column name").text; }
         return c;
     }
-    JoinChain joinChain() {
+    // tables counts the table references of the FROM clause so far
+    JoinChain joinChain(int& tables) {
         JoinChain chain;
-        chain.refs.push_back(tableRef());
+        chain.refs.push_back(tableRef(tables));
         for (;;) {
             if (accept("INNER")) expect("JOIN");
             else if (!accept("JOIN")) return chain;
-            chain.refs.push_back(tableRef());
+            chain.refs.push_back(tableRef(tables));
             expect("ON");
             chain.on.push_back(clause());
         }
     }
-    TableRef tableRef() {
+    TableRef tableRef(int& tables) {
+        if (++tables > MAX_TABLES) throw SqlError{"syntax", "a FROM clause may name at most " + std::to_string(MAX_TABLES) + " tables", cur().line, cur().col};
         TableRef r;
         r.line = cur().line; r.col = cur().col;
         if (accept("(")) {

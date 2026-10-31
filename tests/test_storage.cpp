@@ -531,6 +531,53 @@ const Test TESTS[] = {
                   after == "a\n0 rows, hits=0 misses=1 evictions=0 reads=1 writes=0\nerror: unknown table T\n" && filesIn(DIR) == "R.db S.db catalog.db ";
         return ok ? "" : failed + after + filesIn(DIR);
     }},
+    {"a missing table file is an error for that table only, and the other tables still work", [] {
+        fresh();
+        tool({"create-table", "--db", DIR, "--name", "Q", "--schema", "a:INT"});
+        tool({"create-table", "--db", DIR, "--name", "R", "--schema", "a:INT"});
+        std::ofstream(DIR + "/r.csv") << "1\n2\n";
+        std::filesystem::remove(DIR + "/Q.db");
+        std::string got = tool({"load", "--db", DIR, "--table", "R", "--file", DIR + "/r.csv"}) + tool({"scan", "--db", DIR, "--table", "R"}) +
+                          tool({"create-table", "--db", DIR, "--name", "S", "--schema", "b:INT"}) + tool({"scan", "--db", DIR, "--table", "Q"}) +
+                          tool({"layout", "--db", DIR, "--table", "Q", "--page", "0"}) + tool({"load", "--db", DIR, "--table", "Q", "--file", DIR + "/r.csv"});
+        std::string missing = "io error: cannot open " + DIR + "/Q.db: No such file or directory\n";
+        std::string want = "loaded 2 rows into R, now 2 tuples on 1 data pages\na\n1\n2\n2 rows, hits=0 misses=2 evictions=0 reads=2 writes=0\ncreated table S (b INT) in " + DIR + "/S.db\n" +
+                           missing + missing + missing;
+        return got == want && !std::filesystem::exists(DIR + "/Q.db") ? "" : got;
+    }},
+    {"a page read that fails leaves its frame empty, the page it evicted written back and no longer claimed", [] {
+        DiskManager disk;
+        fresh();
+        std::filesystem::create_directories(DIR);
+        uint32_t f = disk.createTemp(DIR);
+        std::string got;
+        for (Policy policy : {Lru, Clock}) {
+            BufferPool pool(disk, 1, policy);
+            uint32_t pageNo;
+            pool.newPage(f, pageNo)[100] = 7;
+            pool.unpin({f, pageNo}, true);
+            unsigned long long writes = disk.total.writes;
+            std::string error = errorOf([&] { pool.fetch({f, 99}); });
+            const BufferPool::Frame& frame = pool.frames[0];
+            got += (error.rfind("io error: ", 0) == 0 ? "" : error + " ") + ints({frame.used, frame.dirty, (long long)pool.table.size(), (long long)pool.evictions, (long long)(disk.total.writes - writes)});
+            got += ints({pool.fetch({f, pageNo})[100]}) + "| ";
+            pool.unpin({f, pageNo}, false);
+        }
+        disk.remove(f);
+        return got == "0 0 0 0 1 7 | 0 0 0 0 1 7 | " ? "" : got;
+    }},
+    {"catalog.db gets the mode the table files get, under any umask", [] {
+        auto mode = [](const std::string& path) { return int(std::filesystem::status(path).permissions() & std::filesystem::perms::all); };
+        std::string got;
+        for (mode_t mask : {mode_t(022), mode_t(077)}) {
+            fresh();
+            mode_t old = ::umask(mask);
+            tool({"create-table", "--db", DIR, "--name", "R", "--schema", "a:INT"});
+            ::umask(old);
+            got += ints({mode(DIR + "/catalog.db"), mode(DIR + "/R.db")});
+        }
+        return got == ints({0644, 0644, 0600, 0600}) ? "" : got;
+    }},
     {"a bad --db, a long name or a huge VARCHAR length is a one line error, not an abort", [] {
         fresh();
         std::filesystem::create_directories(DIR);

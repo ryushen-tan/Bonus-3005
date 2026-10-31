@@ -1,6 +1,6 @@
 // JSON values, a parser that reports where it failed, and a writer
 #pragma once
-#include "lexer.hpp"
+#include "sqlparse.hpp"
 #include <algorithm>
 #include <cstdio>
 #include <utility>
@@ -28,9 +28,8 @@ inline Json jsonBool(bool b) { Json j; j.kind = Json::Bool; j.text = b ? "true" 
 inline Json jsonArray() { Json j; j.kind = Json::Array; return j; }
 inline Json jsonObject() { Json j; j.kind = Json::Object; return j; }
 
-// the parser recurses once per array or object, so a document nested deeper than any plan is an error
-// rather than a stack overflow
-constexpr int MAX_JSON_DEPTH = 1000;
+// the parser recurses once per array or object, so a document nested deeper than any plan a statement can
+// become (MAX_JSON_DEPTH, with the limits of a statement in sqlparse.hpp) is an error rather than a stack overflow
 struct JsonParser {
     const std::string& s; size_t i = 0; int line = 1, depth = 0; size_t lineStart = 0;
     int col() const { return int(i - lineStart) + 1; }

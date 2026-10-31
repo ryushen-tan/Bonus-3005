@@ -152,15 +152,19 @@ struct Database {
     }
     // a table's name is its file's name too, <name>.db, and file systems such as macOS's ignore case. So the
     // name is an identifier short enough for the 255 bytes a file name may have, never catalog in any case,
-    // and never an existing table's name in another case
-    Table& createTable(const std::string& name, std::vector<Col> cols) {
+    // and never an existing table's name in another case. What is wrong with a new table's name, or nothing
+    std::string tableNameProblem(const std::string& name) {
         bool identifier = !name.empty() && !dig(name[0]) && std::all_of(name.begin(), name.end(), wordChar);
-        if (!identifier) throw Error{"error: table name '" + name + "' must be a letter or underscore followed by letters, digits and underscores"};
-        if (name.size() > 252) throw Error{"error: table name " + name + " is longer than 252 characters, the most that leaves room for .db in a file name"};
-        if (::strcasecmp(name.c_str(), "catalog") == 0) throw Error{"error: table name " + name + " is taken by the catalog's own file, catalog.db"};
-        if (find(name)) throw Error{"error: table " + name + " already exists"};
+        if (!identifier) return "table name '" + name + "' must be a letter or underscore followed by letters, digits and underscores";
+        if (name.size() > 252) return "table name " + name + " is longer than 252 characters, the most that leaves room for .db in a file name";
+        if (::strcasecmp(name.c_str(), "catalog") == 0) return "table name " + name + " is taken by the catalog's own file, catalog.db";
+        if (find(name)) return "table " + name + " already exists";
         for (const Table& t : tables)
-            if (::strcasecmp(t.name.c_str(), name.c_str()) == 0) throw Error{"error: table " + name + " would share a file with table " + t.name + ": table names may not differ only in case"};
+            if (::strcasecmp(t.name.c_str(), name.c_str()) == 0) return "table " + name + " would share a file with table " + t.name + ": table names may not differ only in case";
+        return "";
+    }
+    Table& createTable(const std::string& name, std::vector<Col> cols) {
+        if (std::string problem = tableNameProblem(name); !problem.empty()) throw Error{"error: " + problem};
         for (Col& c : cols) {
             if (c.name.size() > 255) throw Error{"error: column name " + c.name + " is longer than 255 characters"};
             c.rel = name;

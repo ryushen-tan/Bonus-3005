@@ -61,10 +61,19 @@ one frame is taken to write its output. Every memory-holding operator below that
 that one frame free (`parentFrames`). So at any depth of nesting the overhead is one frame, never one per
 level. A nested loop join with such an input on both sides writes its inner input first and only then
 its outer, whose reader takes a frame for the rest of the join; the inner's reader is made last. So
-neither input is materialised while the other holds a frame, and each gets the whole budget. The result
-is that every plan runs at B = 4: a single operator never needs more than 4 frames, and there is only
-ever one running. The tests run every plan at B = 4, among them nested loop joins with a sort, a hash
-distinct, a hash group_by or another join on each side.
+neither input is materialised while the other holds a frame, and each gets the whole budget.
+
+A union_all is the one pipelined operator that opens an input late: its right input only once the left
+is used up. Under a parent that writes the union_all's output, the parent's writer holds its frame by
+then, so a right input that materialised inputs of its own would need two output frames at once (five
+frames at B = 4 for a sort over a distinct, say). So when a union_all's output is written for a parent
+and its right input holds memory, the union_all writes that right input to a file of its own first,
+before it opens its left input and before the parent takes its frame, and later reads the file in its
+place. The result is that every plan runs at B = 4: a single operator never needs more than 4 frames,
+and there is only ever one running. The tests run every plan at B = 4, among them nested loop joins
+with a sort, a hash distinct, a hash group_by or another join on each side, and a sort, a hash
+group_by and a nested loop join over a union_all whose right input is a sort over a distinct, a
+group_by over a join, or a join over a join.
 
 What the rule costs: the materialised result is written once and read once more than a fully pipelined
 executor would need. Section 6 of REPORT_M2.md measures it. Section 6 of DESIGN_M4.md explains why the
@@ -81,10 +90,10 @@ least 5 frames (two blocks of one page, two inner pages, one outer page).
 |---|---|---|
 | seqscan | 1, the data page it is handing out | Module 1's scan, which copies a directory page's list of data pages and unpins it, so only one page is ever pinned |
 | filter, project, rename, limit | 0 | |
-| union_all | 0; the right input is opened only after the left is closed, so at most one scan below it holds a page | |
+| union_all | 0; the right input is read only after the left is closed, so at most one scan below it holds a page. Under a parent that writes its output, a right input that holds memory is written to a file first | section 2 |
 | sort | pass 0: B − 1 reserved, plus the page its input arrives in; merges: B; final pass: up to B − 1 run pages | below |
 | distinct, group_by (sort) | as sort; a group_by with no keys 0 | |
-| distinct, group_by (hash) | B − 1, first all of them the table, then all of them partition buffers; plus the input page | section 6 |
+| distinct, group_by (hash) | B − 1, first all of them the table, then all of them partition buffers while one group is aggregated in passing; plus the input page | section 6 |
 | nested_loop_join | B − 2 block pages, taken as the block fills, plus the outer's page and the inner's page | section 2 |
 | hash_join | partition phase B − 1 buffers plus the input page; probe phase the build partition's pages plus one page for reading | below |
 | sort_merge_join | its two sorts, one after the other; then 3: one page of the left run, the current and previous page of the right run | |
@@ -152,9 +161,10 @@ M pages on the left (the build side), N on the right, B frames.
 
 Total I/O when nothing overflows: (M + N) to read the inputs, about (M + N) to write the partitions, and
 (M + N) to read them back, which is the 3(M + N) of the formula plus the part-full pages. The hash
-functions are FNV-1a over the bytes of the key values with a seed (numbers hash by value, so `1` and
-`1.0` agree), written here rather than `std::hash` so the partitions, and with them the counters, are the
-same on every platform.
+functions are FNV-1a over the bytes of the key values with a seed, written here rather than `std::hash`
+so the partitions, and with them the counters, are the same on every platform. Numbers hash by value, so
+`1` and `1.0` agree, and text by its 2 byte length and then its bytes, as a record holds it, so the keys
+('ab', 'c') and ('a', 'bc') hash apart.
 
 ## 6 The other memory-holding operators
 
@@ -169,31 +179,38 @@ same on every platform.
   the frames free beside the input page (B − 1 at the root). All W of them are the table of groups. A
   tuple whose group is in the table updates it, and a new group goes in while it fits. If every group
   fits, that is the only pass: the input is read once and nothing is written. The first group that does
-  not fit ends the table. The table is written out through one of its own frames, the W frames become W
-  partition buffers, and that tuple and the rest of the input go to partition h(key) mod W. When the
-  input ends, the table written out is read back through the input's frame, and its groups go to their
-  partitions too, so every part of a group is in the same partition. Each partition is then handled the
-  same way, table first, with the next level's hash functions, so a partition whose groups still do not
-  fit is split W ways again. This works for any number of groups at any B ≥ 4, because W ≥ 2 and each
-  split makes progress, and a hot key cannot stall it, because all its tuples fold into one entry of
-  the table. Sort mode sorts on the keys and aggregates adjacent equal keys.
+  not fit ends the table. The table is given up, and the input is read again from its start with each of
+  the W frames the buffer of a partition. The first group of that pass is aggregated as its tuples go
+  past, the way sort mode aggregates its current group, and every tuple of any other group goes to
+  partition h(key) mod W. Each partition is then handled the same way, table first, with the next level's
+  hash functions. A level that partitions finishes the group it keeps and gives each partition only the
+  other groups, so every partition has fewer groups than its input, whatever the keys hash to, and the
+  levels end at any B ≥ 4. A hot key cannot stall it either: in the table all its tuples fold into one
+  entry. Sort mode sorts on the keys and aggregates adjacent equal keys.
 
-  A partition holds groups, not input tuples: the key columns, then for each aggregate its count and its
-  sum (sum, avg) or its minimum or maximum (min, max), which the next level combines. An entry of the
-  table is counted as the bytes that record takes, with a VARCHAR minimum or maximum at its declared
-  length because it can grow, plus a slot. The table holds no more entries than its W pages would hold
-  under the slotted page layout, so what it keeps really fits in its frames. The hashes are the seeded
-  FNV-1a of section 5 passed through murmur3's 64 bit finaliser. Without the finaliser the low bits of
-  FNV-1a split the keys the same way whatever the seed, and with a power of two frames a partition would
-  never split again.
+  The table and the partitions see each input tuple cut down to the columns the grouping reads: its
+  keys, then the columns its aggregates take. A partition holds those tuples, not groups. A group can
+  take more than a page (16 maxima of a VARCHAR(255) are 4244 bytes), and such a tuple is never longer
+  than an input tuple, so hash mode runs every grouping sort mode runs. That is also why the table is
+  given up rather than written out: reading the input again costs the pages read before the table
+  filled, and writes nothing. An entry of the table is counted as the bytes of its key, a count for each
+  aggregate, and its sum or its minimum or maximum, a VARCHAR one at its declared length because it can
+  grow, plus a slot. The table holds no more entries than its W pages would hold under the slotted page
+  layout, an entry longer than a page taking whole pages, so what it keeps really fits in its frames.
+  The one group of a partitioning pass is held beside them, like the current group of sort mode and the
+  one group of a group_by with no keys. The hashes are the seeded FNV-1a of section 5 passed through
+  murmur3's 64 bit finaliser. Without the finaliser the low bits of FNV-1a split the keys the same way
+  whatever the seed, and with a power of two frames a partition would never split again.
 
-  **Cost.** Let R be the pages of one group record per input tuple (for distinct, the pages of the input)
-  and G = R · groups / tuples the pages the groups take. If G ≤ W the cost is read(x). Otherwise, at
-  each level k = 0, 1, ... for which G / W^k > W, there are W^k inputs whose groups do not fit. Each writes
-  out and rereads its full table, 2W pages, and splits its records W ways, each partition with a part
-  full last page, to be read back at the next level:
+  **Cost.** Let R be the pages the input's tuples, cut down to those columns, take packed with their
+  slots, as the partitions hold them, and G the pages its groups take in the table. If G ≤ W the cost is
+  read(x). Otherwise, at each level k = 0, 1, ... for which G / W^k > W, there are W^k inputs whose
+  groups do not fit, each of r_k pages (r_0 = read(x), then r_k = ceil(R / W^k)). Each is read until its
+  table is full, which is ceil(r_k · W / (G / W^k)) pages if new groups come at an even rate, then read
+  again in full and split W ways, each partition with a part-full last page, written and read back at
+  the next level:
 
-  cost = read(x) + Σ_k [ 2W · W^k + 2 · W^(k+1) · ceil(R / W^(k+1)) ]
+  cost = read(x) + Σ_k [ W^k · ceil(r_k · W^(k+1) / G) + 2 · W^(k+1) · ceil(R / W^(k+1)) ]
 
   The trace shows `levels=` (the number of levels k), `partitions=` (W) and the pages of every partition
   written. Section 7 of REPORT_M2.md measures this against the formula, and the cost model of Module 4
@@ -201,7 +218,13 @@ same on every platform.
 - **group_by edge cases.** With no grouping columns, empty input gives exactly one row: COUNT is 0, and
   SUM, AVG, MIN or MAX of it is an error, as the module says. With grouping columns, empty input gives
   no rows. AVG is an exact integer sum divided by the count, written with four decimals, a half rounded
-  away from zero as PostgreSQL's `round` does (1/32 is 0.0313), and never as -0.0000. SUM is a 64 bit
+  away from zero as PostgreSQL's `round` does (1/32 is 0.0313), and never as -0.0000. The quotient is a
+  double, so a half such as 34153 / 800 = 42.69125 comes out a little below or above it; the rounding is
+  done on the shortest decimal that reads back as that double, which is the half itself. Every half an AVG
+  of INT values can be prints its exact rounding (tested for every |sum| < 3000 and count < 3300). A value
+  that is not a half but closer to one than a double can tell apart, which takes an average near 10^9 over
+  hundreds of thousands of rows, prints as its double reads. The double itself keeps every bit, in temporary files too, so a SUM or
+  AVG over an AVG sums the unrounded values and rounds only what it prints. SUM is a 64 bit
   integer, written to temporary files as 8 bytes so a sum above 2^31 survives a sort. SUM and AVG take
   any number: over a REAL (an AVG from a subquery) the sum is kept as a double and SUM is a REAL.
 - **union** sorts both inputs together and drops adjacent duplicates. **intersect** and **except** sort
@@ -209,10 +232,14 @@ same on every platform.
   with duplicates on both sides). A column that is INT on one side and REAL (an AVG) on the other is REAL,
   and its INT values take the REAL form as they arrive, so the column prints with four decimals whether
   or not its values went through a temporary file. union_all does the same.
-- **A tuple of a temporary file** must fit on one page with its slot, 4084 bytes. Only a join of very
-  wide tables makes a longer one. An operator that has to write it (a sort, a grouping with keys, a set
-  operation over the join) stops with `error: a tuple of 4085 bytes does not fit on a page of a
-  temporary file`, never dropping it. A group_by with no keys counts it without writing it.
+- **A tuple of a temporary file** must fit on one page with its slot, 4084 bytes. The tuples written
+  are an operator's own input tuples, or the output of an input it materialises, so a longer one comes
+  only from an operator whose output is wider than its input: a join of very wide tables, a projection
+  that repeats wide columns, or a group_by of many wide minima and maxima (16 maxima of a VARCHAR(255)
+  and a key are 4116 bytes). An operator that has to write it (a sort, a grouping with keys or a set
+  operation over it, or a parent that materialises it) stops with `error: a tuple of 4085 bytes does not
+  fit on a page of a temporary file`, never dropping it. A group_by with no keys counts it without
+  writing it.
 - **limit** stops calling its child after n tuples; the test checks the scan under `limit 2` read one page.
 
 ## 7 Plan checking and errors
@@ -227,8 +254,10 @@ so the optimizer can add `est_rows` and `est_cost`. Messages name the node and i
 (root.child): missing required field 'keys'.`, `Node 'merge_join' (root.child): unknown operator
 'merge_join'.` and `Node 'except' (root): unexpected field 'child'.`. Malformed JSON is reported by the
 JSON reader with its line and column. The reader recurses once per array or object, so it stops at
-arrays and objects nested more than 1000 deep, with the line and column, rather than overflowing the
-stack; a plan of 900 nested operators runs. Then `buildNode` resolves every table and column and parses
+arrays and objects nested deeper than the deepest plan a statement within the SQL limits can give
+(`MAX_JSON_DEPTH` in sqlparse.hpp), with the line and column, rather than overflowing the stack. exec, opt, sql
+and the shell do their work on a thread with a 1 GB stack (`onLargeStack` in cli.hpp), so a plan of that
+depth runs. Then `buildNode` resolves every table and column and parses
 and type checks every condition, bottom up, before anything is opened. So an unknown table or column, an
 ambiguous column, a type error, a join condition a hash join cannot evaluate, or two columns with the same
 qualified name in a join is rejected before any page is read.

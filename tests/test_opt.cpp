@@ -84,6 +84,29 @@ std::string shellDatabase() {
     shellErrors("CREATE TABLE T (a INT, b VARCHAR(5));\nINSERT INTO T VALUES (1, 'x');\nINSERT INTO T VALUES (2, 'y');\n", {"--db", dir});
     return dir;
 }
+// statistics for T.a whose minimum is not a number, so that reading the catalog back throws std::invalid_argument
+void corruptStatistics(const std::string& dir) {
+    Database db(dir, 8);
+    Table& t = db.table("T");
+    t.stats.analyzed = true;
+    t.stats.columns[0] = {1, textValue("x"), textValue("x"), {}, 4};
+    db.saveCatalog();
+}
+bool oneInternalError(const std::string& out) { return out.compare(0, 16, "internal error: ") == 0 && out.find('\n') == out.size() - 1; }
+std::string repeated(const std::string& s, int n) { std::string out; for (int i = 0; i < n; i++) out += s; return out; }
+// sql compile, opt plan and exec run chained by files, as tests/e2e/run.py runs them: how many rows came out,
+// or what the tool that failed printed
+std::string chained(const std::string& sql, std::vector<std::string> optArgs) {
+    std::ofstream(DIR + "/chain.sql") << sql;
+    std::ostringstream logical, physical, result;
+    if (sqlTool({"compile", "--db", DIR, "--file", DIR + "/chain.sql", "--json"}, logical) != 0) return logical.str();
+    std::ofstream(DIR + "/chain.json") << logical.str();
+    optArgs.insert(optArgs.begin(), {"plan", "--db", DIR, "--logical", DIR + "/chain.json"});
+    if (optTool(optArgs, physical) != 0) return physical.str();
+    std::ofstream(DIR + "/plan.json") << physical.str();
+    if (execTool({"run", "--db", DIR, "--plan", DIR + "/plan.json", "--json"}, result) != 0) return result.str();
+    return std::to_string(parseJson(result.str()).find("rows")->items.size()) + " rows";
+}
 
 const std::vector<std::string> QUERIES = {
     "SELECT name, age FROM Emp WHERE age > 60;",
@@ -110,6 +133,7 @@ const std::vector<std::string> QUERIES = {
     "SELECT t.city, COUNT(*) FROM (SELECT city FROM Emp UNION ALL SELECT place FROM Loc) AS t WHERE t.city <> 'Kanata' GROUP BY t.city;",
     "SELECT e.name, m.name FROM Emp e JOIN Emp m ON e.mgr = m.eid;",
     "SELECT COUNT(*) FROM Dept d, Proj p, Loc l WHERE d.did < 5 AND p.pid < 50 AND (d.did = p.did OR p.pid = l.pid);",
+    "SELECT did, COUNT(*) AS did FROM Emp GROUP BY did HAVING COUNT(*) > 80;",
 };
 
 struct Test { const char* name; std::function<std::string()> run; };
@@ -271,6 +295,44 @@ const std::vector<Test> TESTS = {
         }
         return problems;
     }},
+    {"the optimizer gives SUM of a REAL the type REAL, and SUM of an INT or a BIGINT the type BIGINT", [] {
+        Database db(DIR, 32);
+        Optimizer o{db, 32, {}, {}};
+        std::vector<Col> cols = o.outputCols(compileSql(db, "SELECT SUM(t.a), SUM(t.s), SUM(t.did) FROM (SELECT did, AVG(age) AS a, SUM(age) AS s FROM Emp GROUP BY did) AS t;"));
+        return cols[0].type == RealT && cols[1].type == BigT && cols[2].type == BigT ? "" : "the types are " + typeName(cols[0]) + ", " + typeName(cols[1]) + " and " + typeName(cols[2]);
+    }},
+    {"conditions that rules 3 and 7 bring together past the height of one condition are split, and the query runs", [] {
+        Database db(DIR, 32);
+        std::string equalities = "e.did = d.did" + repeated(" AND e.did = d.did", 999), above, below;
+        for (int i = 0; i < 1000; i++) { above += (i ? " AND did > -" : "did > -") + std::to_string(i + 1); below += (i ? " AND did < " : "did < ") + std::to_string(i + 5); }
+        std::vector<Row> joined = runSql(db, "SELECT COUNT(*) FROM Emp e JOIN Dept d ON " + equalities + " WHERE " + equalities + ";", 32, true);
+        std::vector<Row> grouped = runSql(db, "SELECT did, COUNT(*) FROM Emp WHERE " + above + " GROUP BY did HAVING " + below + ";", 32, true);
+        bool ok = sameBag(joined, runSql(db, "SELECT COUNT(*) FROM Emp e JOIN Dept d ON e.did = d.did;", 32, true)) &&
+                  sameBag(grouped, runSql(db, "SELECT did, COUNT(*) FROM Emp GROUP BY did HAVING did < 5;", 32, true)) && grouped.size() == 5;
+        return ok ? "" : "wrong rows";
+    }},
+    {"the plans of statements at the limits of the SQL front end go through opt and exec", [] {
+        std::string unions = "SELECT did FROM Dept WHERE did = 1" + repeated(" UNION ALL SELECT did FROM Dept WHERE did = 1", 1000) + ";";
+        std::string nested = "SELECT eid FROM Emp WHERE eid < 5";
+        for (int i = 0; i < 450; i++) { std::string t = "t" + std::to_string(i); nested = "SELECT " + t + ".eid FROM (" + nested + ") AS " + t + " WHERE " + t + ".eid < 5"; }
+        std::string conjuncts = "SELECT COUNT(*) FROM Emp e, Dept d WHERE e.did = d.did";
+        for (int i = 1; i < 1000; i++) conjuncts += " AND e.eid > -" + std::to_string(i);
+        std::string got = chained(unions, {}) + ", " + chained(nested + ";", {}) + ", " + chained(conjuncts + ";", {"--without-rules", "7"});
+        return got == "1001 rows, 5 rows, 1 rows" ? "" : got;
+    }},
+    {"explain writes a node a line, its fields separated by single spaces, then the total", [] {
+        Database db(DIR, 32);
+        std::string got = explainText(db, "SELECT name FROM Emp WHERE age > 60;", 32);
+        return got == "project [Emp.name] est_rows=550 est_cost=0\n  filter (Emp.age > 60) est_rows=550 est_cost=0\n    seqscan Emp est_rows=3000 est_cost=30\ntotal est_cost=30\n" ? "" : got;
+    }},
+    {"ANALYZE needs a frame per column and one for the scan", [] {
+        std::string got;
+        for (int frames : {7, 8}) {
+            Database db(DIR, frames);
+            try { analyzeTable(db, db.table("Emp"), 20); got += "analyzed at " + std::to_string(frames) + "\n"; } catch (const Error& e) { got += e.msg + "\n"; }
+        }
+        return got == "error: ANALYZE of Emp needs at least 8 frames: one per column and one for the scan while it reads the table, and three for each column's sort after that\nanalyzed at 8\n" ? "" : got;
+    }},
     {"opt tool commands", [] {
         std::ofstream(DIR + "/q.json") << dumpJson(logicalJson(compileSql(*openDatabase(DIR, 8), QUERIES[1])));
         std::ostringstream plan, explain, dp, bad;
@@ -320,6 +382,44 @@ const std::vector<Test> TESTS = {
         std::string usage = "error: write ANALYZE table [buckets], with buckets from 1 to 999999999\n";
         return got == usage + usage + "error: the number of buckets must be at least 1\nexit 1" && buckets == 2 ? "" : got;
     }},
+    {"SET frames that cannot reopen the database is an error, and the shell goes on with the database it had", [] {
+        std::string dir = shellDatabase(), catalog = dir + "/catalog.db";
+        std::ostringstream out;
+        Shell shell(dir, 8, out);
+        std::filesystem::rename(catalog, dir + "/catalog.kept");
+        std::filesystem::create_directory(catalog);
+        bool set = shell.runStatement("SET frames = 16;"), select = shell.runStatement("SELECT COUNT(*) FROM T;");
+        std::filesystem::remove_all(dir);
+        std::string text = out.str(), first = text.substr(0, text.find('\n') + 1), table = " count_star\n------------\n          2\n(1 row)";
+        bool ok = !set && select && shell.frames == 8 && first.find("error: ") != std::string::npos && first.find(catalog) != std::string::npos &&
+                  text.compare(first.size(), table.size(), table) == 0;
+        return ok ? "" : text;
+    }},
+    {"an exception that is not an Error is one internal error line in opt, sql, the shell and each statement of the shell", [] {
+        std::string dir = shellDatabase();
+        std::ostringstream statementOut;
+        Shell shell(dir, 8, statementOut);
+        corruptStatistics(dir);
+        bool set = shell.runStatement("SET frames = 16;"), select = shell.runStatement("SELECT COUNT(*) FROM T;");
+        std::string statement = statementOut.str(), firstLine = statement.substr(0, statement.find('\n') + 1);
+        std::ofstream(dir + "/q.sql") << "SELECT a FROM T;";
+        std::ostringstream opt, sql;
+        int optCode = optTool({"plan", "--db", dir, "--logical", dir + "/q.sql"}, opt), sqlCode = sqlTool({"check", "--db", dir, "--file", dir + "/q.sql"}, sql);
+        std::string shellRun = shellErrors("", {"--db", dir});
+        std::filesystem::remove_all(dir);
+        bool ok = !set && select && oneInternalError(firstLine) && statement.find("(1 row)") != std::string::npos && optCode == 1 && oneInternalError(opt.str()) &&
+                  sqlCode == 1 && oneInternalError(sql.str()) && shellRun.compare(0, 16, "internal error: ") == 0 && shellRun.substr(shellRun.size() - 7) == "\nexit 1";
+        return ok ? "" : statement + opt.str() + sql.str() + shellRun;
+    }},
+    {"the shell refuses the table names the catalog refuses in the specification's error format", [] {
+        std::string dir = shellDatabase();
+        std::string got = shellErrors("CREATE TABLE catalog (x INT);\n  CREATE TABLE t (x INT);\nCREATE TABLE U (x INT);\n", {"--db", dir});
+        size_t tables = Database(dir, 8).tables.size();
+        std::filesystem::remove_all(dir);
+        std::string want = "error: name: table name catalog is taken by the catalog's own file, catalog.db at line 1, column 14\n"
+                           "error: name: table t would share a file with table T: table names may not differ only in case at line 2, column 16\nexit 1";
+        return got == want && tables == 2 ? "" : got;
+    }},
     {"the shell checks the frames before it opens the database, and a database it cannot open is an error, not an abort", [] {
         std::string dir = shellDatabase(), missing = DIR + "-none";
         std::string few = shellErrors("", {"--db", missing, "--frames", "0"}), set = shellErrors("SET frames = 3;\n", {"--db", dir}), file = shellErrors("", {"--db", dir + "/T.db"});
@@ -330,9 +430,88 @@ const std::vector<Test> TESTS = {
         bool ok = few == "error: --frames must be at least 4\nexit 1" && !created && set == "error: frames must be at least 4\nexit 1" && oneError;
         return ok ? "" : few + "\n" + set + "\n" + file;
     }},
+
+    // ---- the cost model against what Module 2 does ----
+    {"hash distinct and group_by cost what Module 2's hash grouping reads and writes", [] {
+        std::string dir = DIR + "-hash", problems;
+        std::filesystem::remove_all(dir);
+        {
+            Database db(dir, 64);
+            std::vector<std::string> rows;
+            for (int i = 0; i < 3000; i++) rows.push_back(std::to_string(i % 1000) + ",n" + std::to_string(i % 7) + "," + std::to_string(i));
+            table(db, "G", "g:INT,name:VARCHAR(255),i:INT", rows);
+            analyzeTable(db, db.table("G"), 20);
+            // at these B no level is on the edge of fitting, where uneven partitions make some split and others not
+            for (const std::string& sql : {"SELECT g, MAX(name) FROM G GROUP BY g;", "SELECT DISTINCT g, i FROM G;"})
+                for (int b : {6, 8, 16}) {
+                    Optimizer o{db, b, {}, {}};
+                    LogicalNode plan = o.optimize(compileSql(db, sql));
+                    LogicalNode* grouping = &plan;
+                    while (grouping->op != "group_by" && grouping->op != "distinct") grouping = &grouping->kids[0];
+                    grouping->algorithm = "hash";
+                    o.estimate(plan, b);
+                    Database run(dir, b);
+                    std::unique_ptr<Operator> root = buildPlan(run, physicalJson(plan));
+                    execute(run, *root);
+                    const Operator* op = root.get();
+                    while (op->op != grouping->op) op = op->children[0].get();
+                    Counters actual = totals(*op);
+                    double io = double(actual.io.reads + actual.io.writes);
+                    if (std::fabs(grouping->cost - io) > 0.1 * io) problems += "B=" + std::to_string(b) + " " + sql + " estimated " + std::to_string(std::llround(grouping->cost)) + ", did " + std::to_string((long long)io) + " " + op->notes + "\n";
+                }
+        }
+        std::filesystem::remove_all(dir);
+        return problems;
+    }},
+    {"a distinct below a group_by with no keys is costed with all B frames, as Module 2 gives it", [] {
+        Database db(DIR, 64);
+        std::string problems;
+        for (int b : {4, 5, 8}) {
+            Optimizer o{db, b, {}, {}};
+            LogicalNode below = o.optimize(compileSql(db, "SELECT COUNT(*) FROM (SELECT DISTINCT name, city FROM Emp) AS t;")), top = o.optimize(compileSql(db, "SELECT DISTINCT name, city FROM Emp;"));
+            const LogicalNode* distinct = &below;
+            while (distinct->op != "distinct") distinct = &distinct->kids[0];
+            if (distinct->cost != top.cost) problems += "B=" + std::to_string(b) + " below " + std::to_string(distinct->cost) + ", at the top " + std::to_string(top.cost) + "\n";
+        }
+        return problems;
+    }},
+    {"the join enumeration costs a join below another with the B - 1 frames Module 2 gives it", [] {
+        std::string dir = DIR + "-lower", problems;
+        std::filesystem::remove_all(dir);
+        {
+            Database db(dir, 64);
+            // 30 rows of 404 bytes are 3 pages, as the estimate says, ten to a page with their slots
+            for (const char* name : {"A", "B", "C"}) {
+                std::vector<std::string> rows;
+                for (int i = 0; i < 30; i++) rows.push_back(std::to_string(i) + "," + std::string(198, 'p') + "," + std::string(198, 'q'));
+                table(db, name, "k:INT,p:VARCHAR(200),q:VARCHAR(200)", rows);
+                analyzeTable(db, db.table(name), 20);
+            }
+            int b = 5;
+            Optimizer o{db, b, {}, {}};
+            LogicalNode plan = o.optimize(compileSql(db, "SELECT * FROM A a, B b, C c WHERE a.k < b.k AND b.k < c.k;"));
+            std::string outer, cost;
+            for (const std::string& line : o.dpTable)
+                if (line.rfind("{a,b,c}", 0) == 0 && line.find("* ") != std::string::npos) outer = line.substr(line.find("* ") + 2, line.find(" outer") - line.find("* ") - 2);
+            for (const std::string& line : o.dpTable)
+                if (!outer.empty() && line.rfind(outer + " ", 0) == 0 && line.find("* ") != std::string::npos) cost = line.substr(line.find("cost=") + 5);
+            Database run(dir, b);
+            std::unique_ptr<Operator> root = buildPlan(run, physicalJson(plan));
+            execute(run, *root);
+            const Operator* lower = root.get();
+            while (lower->op != "nested_loop_join" || lower->children[0]->op == "nested_loop_join") lower = lower->children[0].get();
+            Counters actual = totals(*lower);
+            long long blocks = std::stoll(lower->notes.substr(lower->notes.find("blocks=") + 7));
+            // the directory pages: the outer's once, the inner's once a block
+            long long io = (long long)(actual.io.reads + actual.io.writes) - 1 - blocks;
+            if (cost.empty() || std::stoll(cost) != io) problems += outer + " cost " + cost + ", read " + std::to_string(io) + " data pages " + lower->notes + "\n";
+        }
+        std::filesystem::remove_all(dir);
+        return problems;
+    }},
 };
 
-int main() {
+int runTests() {
     setup();
     int fails = 0;
     for (const Test& t : TESTS) {
@@ -346,3 +525,4 @@ int main() {
     std::cout << TESTS.size() - fails << "/" << TESTS.size() << " passed\n";
     return fails != 0;
 }
+int main() { return onLargeStack(std::cout, runTests); }

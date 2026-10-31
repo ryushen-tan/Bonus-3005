@@ -32,6 +32,8 @@ inline std::string freeName(const std::string& name, const std::function<bool(co
 
 struct SqlCompiler {
     std::function<const std::vector<Col>*(const std::string&)> tables;
+    // what the database's catalog finds wrong with the name of a new table, or nothing
+    std::function<std::string(const std::string&)> tableNameProblem;
     std::map<std::string, std::vector<Col>> created;
 
     const std::vector<Col>* schemaOf(const std::string& name) {
@@ -99,10 +101,13 @@ struct SqlCompiler {
     }
     bool isKey(const Grouping& g, const Col& c) { return std::any_of(g.keys.begin(), g.keys.end(), [&](const Col& k) { return sameColumn(k, c); }); }
 
-    // every integer is an INT, which is 4 bytes here
-    static void checkInt(const SqlOperand& o) {
-        if (o.literal.size() > 11 || std::stoll(o.literal) < INT32_MIN || std::stoll(o.literal) > INT32_MAX)
+    // every integer is an INT, which is 4 bytes here. It is judged by its value, as the loader judges a field, so
+    // leading zeros do not count; strtoll saturates past the range of a long long, which is far outside 32 bits
+    static long long intLiteral(const SqlOperand& o) {
+        long long value = std::strtoll(o.literal.c_str(), nullptr, 10);
+        if (value < INT32_MIN || value > INT32_MAX)
             sqlFail("type", o.literal + " does not fit in an INT, which has 4 bytes and holds -2147483648 to 2147483647", o.line, o.col);
+        return value;
     }
 
     // a condition as a Bonus 1 condition tree, which the executor parses back from its text; in HAVING the
@@ -110,7 +115,7 @@ struct SqlCompiler {
     std::pair<Node, Col> operandNode(const SqlOperand& o, const std::vector<ScopeEntry>& scope, Grouping* having, const std::string& clause) {
         switch (o.kind) {
             case SqlOperand::Int:
-                checkInt(o);
+                intLiteral(o);
                 return {mk(NumLit, Token{Num, o.literal, o.line, o.col}), Col{"", o.literal, IntT}};
             case SqlOperand::Str: return {mk(StrLit, Token{Str, o.literal, o.line, o.col}), Col{"", quoted(o.literal), StrT, int(o.literal.size())}};
             case SqlOperand::Column: {
@@ -289,9 +294,10 @@ struct SqlCompiler {
     }
 
     Compiled term(const QueryTerm& t) { return t.paren ? query(*t.paren) : block(*t.block, {}, -1); }
-    // 8 the set operators between whole blocks, left associative; then ORDER BY and LIMIT of the whole
+    // 8 the set operators between whole blocks, left associative; then ORDER BY and LIMIT of the whole. The
+    // parser has made a parenthesised query on its own into that query, so a query of one term is one block
     Compiled query(const Query& q) {
-        if (q.terms.size() == 1 && q.terms[0].block) return block(*q.terms[0].block, q.orderBy, q.limit);
+        if (q.terms.size() == 1) return block(*q.terms[0].block, q.orderBy, q.limit);
         Compiled acc = term(q.terms[0]);
         for (size_t i = 1; i < q.terms.size(); i++) {
             Compiled r = term(q.terms[i]);
@@ -327,8 +333,8 @@ struct SqlCompiler {
     // a CREATE TABLE or INSERT is checked here, and later statements of the same script see the new table
     Value insertValue(const SqlOperand& v, const Col& c) {
         if (v.kind == SqlOperand::Int && c.type == IntT) {
-            checkInt(v);
-            return {true, double(std::stoll(v.literal)), std::to_string(std::stoll(v.literal))};
+            long long value = intLiteral(v);
+            return {true, double(value), std::to_string(value)};
         }
         if (v.kind == SqlOperand::Str && c.type == StrT) {
             if (int(v.literal.size()) > c.length) sqlFail("type", quoted(v.literal) + " is longer than " + typeName(c), v.line, v.col);
@@ -337,7 +343,8 @@ struct SqlCompiler {
         sqlFail("type", "column " + c.name + " is " + typeName(c) + " but the value " + operandSql(v) + " is " + (v.kind == SqlOperand::Int ? "an INT" : "a string"), v.line, v.col);
     }
     std::vector<Col> createTable(const Statement& s) {
-        if (schemaOf(s.table)) sqlFail("name", "table " + s.table + " already exists", s.line, s.col);
+        if (schemaOf(s.table)) sqlFail("name", "table " + s.table + " already exists", s.nameLine, s.nameCol);
+        if (std::string problem = tableNameProblem(s.table); !problem.empty()) sqlFail("name", problem, s.nameLine, s.nameCol);
         std::vector<Col> cols;
         for (const ColumnDef& d : s.columns) {
             for (const Col& c : cols) if (c.name == d.name) sqlFail("schema", "column " + d.name + " appears twice in table " + s.table, d.line, d.col);

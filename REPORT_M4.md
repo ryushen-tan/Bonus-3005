@@ -175,12 +175,16 @@ WHERE e.level = 8 AND e.salary > 160000;
 **The plan it chose at B = 4, with its estimate:**
 
 ```
-nested_loop_join (e.eid = w.eid)                        est_rows=889      est_cost=691
-  project [e.eid, e.name, e.age, e.did, e.mgr, e.city]  est_rows=282
-    filter (e.level = 8 and e.salary > 160000)          est_rows=282
-      seqscan Emp                                       est_cost=219
-  project [w.eid, w.hours]
-    seqscan Works                                       est_cost=236
+project [e.name, e.city, e.age, e.did, e.mgr, w.hours] est_rows=889 est_cost=0
+  nested_loop_join (e.eid = w.eid) est_rows=889 est_cost=691
+    project [e.eid, e.name, e.age, e.did, e.mgr, e.city] est_rows=282 est_cost=0
+      filter (e.level = 8 and e.salary > 160000) est_rows=282 est_cost=0
+        rename e est_rows=20000 est_cost=0
+          seqscan Emp est_rows=20000 est_cost=219
+    project [w.eid, w.hours] est_rows=60000 est_cost=0
+      rename w est_rows=60000 est_cost=0
+        seqscan Works est_rows=60000 est_cost=236
+total est_cost=691
 ```
 
 282 estimated rows are 3 pages (`opt dp-table` gives {e} rows=282 pages=3), two blocks of the nested

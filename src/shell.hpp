@@ -139,9 +139,9 @@ struct Shell {
             if (w.size() != 4 || upper(w[1]) != "FRAMES" || w[2] != "=" || !std::all_of(w[3].begin(), w[3].end(), dig) || w[3].size() > 6) throw Error{"error: write SET frames = n"};
             int n = std::stoi(w[3]);
             if (n < MIN_PLAN_FRAMES) throw Error{"error: frames must be at least " + std::to_string(MIN_PLAN_FRAMES)};
-            db.reset();
+            // the database is reopened before the open one is let go, so a failure leaves the shell as it was
+            db = std::make_unique<Database>(dir, n);
             frames = n;
-            db = std::make_unique<Database>(dir, frames);
             out << "SET frames = " << frames << '\n';
         }
         else if (first == "LOAD") {

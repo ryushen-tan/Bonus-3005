@@ -104,7 +104,7 @@ A hash group_by over a hash join: the join holds memory, so the group_by writes 
 B = 8, peak frames 8:
 
 ```
-group_by hash tuples_out=6000 comparisons=9423 reads=189 writes=189 levels=1 partitions=7 spilled_pages=[4,4,4,4,4,4,4]
+group_by hash tuples_out=6000 comparisons=15421 reads=214 writes=168 levels=1 partitions=7 spilled_pages=[2,2,2,2,2,2,2]
   hash_join tuples_out=6000 comparisons=6009418 reads=332 writes=166 partitions=6 pages_left/right=[13/13,14/14,14/14,14/14,15/15,13/13] overflowed=6
     seqscan R6000 tuples_out=6000 comparisons=0 reads=81 writes=0
     seqscan S6000 tuples_out=6000 comparisons=0 reads=81 writes=0
@@ -113,7 +113,7 @@ group_by hash tuples_out=6000 comparisons=9423 reads=189 writes=189 levels=1 par
 B = 16, peak frames 16:
 
 ```
-group_by hash tuples_out=6000 comparisons=8859 reads=199 writes=199 levels=1 partitions=15 spilled_pages=[2,2,2,2,2,2,2,2,2,2,2,2,2,2,2]
+group_by hash tuples_out=6000 comparisons=14856 reads=268 writes=169 levels=1 partitions=15 spilled_pages=[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]
   hash_join tuples_out=6000 comparisons=25320 reads=168 writes=168 partitions=14 pages_left/right=[6/6,6/6,6/6,6/6,6/6,6/6,6/6,6/6,6/6,6/6,6/6,6/6,6/6,6/6] overflowed=0
     seqscan R6000 tuples_out=6000 comparisons=0 reads=81 writes=0
     seqscan S6000 tuples_out=6000 comparisons=0 reads=81 writes=0
@@ -121,17 +121,17 @@ group_by hash tuples_out=6000 comparisons=8859 reads=199 writes=199 levels=1 par
 
 ## 7 Hash distinct against its formula
 
-A hash distinct of R, whose tuples are all different, so the groups take as many pages as the input. Its own reads and writes, and the formula of DESIGN_M2.md section 6.
+A hash distinct of R, whose tuples are all different, so the groups take as many pages as the input. The scan's reads, which include the input read again when a level partitions, the distinct's own reads and writes, and the formula of DESIGN_M2.md section 6.
 
-| N pages | B | levels | partitions per split | own reads | own writes | own I/O | formula | measured / formula |
-|---|---|---|---|---|---|---|---|---|
-| 80 | 4 | 4 | 3 | 364 | 364 | 728 | 564 | 1.29 |
-| 80 | 8 | 2 | 7 | 238 | 238 | 476 | 476 | 1.00 |
-| 80 | 16 | 1 | 15 | 102 | 102 | 204 | 210 | 0.97 |
-| 80 | 64 | 1 | 63 | 188 | 188 | 376 | 378 | 0.99 |
-| 80 | 256 | 0 | 255 | 0 | 0 | 0 | 0 | both 0 |
-| 320 | 4 | 5 | 3 | 2182 | 2182 | 4364 | 4284 | 1.02 |
-| 320 | 8 | 3 | 7 | 796 | 796 | 1592 | 1442 | 1.10 |
-| 320 | 16 | 2 | 15 | 1017 | 1017 | 2034 | 2040 | 1.00 |
-| 320 | 64 | 1 | 63 | 414 | 414 | 828 | 882 | 0.94 |
-| 320 | 256 | 1 | 255 | 757 | 757 | 1514 | 1530 | 0.99 |
+| N pages | B | levels | partitions per split | scan reads | own reads | own writes | total I/O | formula | measured / formula |
+|---|---|---|---|---|---|---|---|---|---|
+| 80 | 4 | 4 | 3 | 86 | 405 | 313 | 804 | 617 | 1.30 |
+| 80 | 8 | 2 | 7 | 90 | 238 | 182 | 510 | 507 | 1.01 |
+| 80 | 16 | 1 | 15 | 98 | 89 | 89 | 276 | 275 | 1.00 |
+| 80 | 64 | 1 | 63 | 146 | 125 | 125 | 396 | 395 | 1.00 |
+| 80 | 256 | 0 | 255 | 81 | 0 | 0 | 81 | 80 | 1.01 |
+| 320 | 4 | 5 | 3 | 326 | 2294 | 1814 | 4434 | 4361 | 1.02 |
+| 320 | 8 | 3 | 7 | 330 | 775 | 695 | 1800 | 1713 | 1.05 |
+| 320 | 16 | 2 | 15 | 338 | 1016 | 776 | 2130 | 2135 | 1.00 |
+| 320 | 64 | 1 | 63 | 386 | 350 | 350 | 1086 | 1139 | 0.95 |
+| 320 | 256 | 1 | 255 | 578 | 503 | 503 | 1584 | 1595 | 0.99 |

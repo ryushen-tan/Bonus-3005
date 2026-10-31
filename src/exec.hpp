@@ -19,7 +19,8 @@ struct Operator {
     std::string op, detail;
     std::vector<Col> schema;
     std::vector<std::unique_ptr<Operator>> children;
-    // set for the inputs of an operator that holds memory when that input holds memory too
+    // set for the inputs of an operator that holds memory when that input holds memory too, and for the right
+    // input of a union_all whose output a parent writes to a temporary file, when that input holds memory
     std::vector<bool> materialize;
     Counters counters;
     std::string notes;
@@ -59,16 +60,18 @@ struct Frames {
     int count() const { return int(held.size()); }
 };
 
-// the pages a sequence of records fills when packed one after another into slotted pages
+// the pages a sequence of records fills when packed one after another into slotted pages. Only an entry of a
+// hash table can be longer than a page, and it takes as many whole pages as its bytes need
 struct Packing {
     int pages = 0;
     size_t room = 0;
     bool add(size_t length, int limit) {
         size_t need = length + SLOT_SIZE;
         if (pages > 0 && room >= need) { room -= need; return true; }
-        if (pages == limit) return false;
-        pages++;
-        room = need > size_t(USABLE_SPACE) ? 0 : USABLE_SPACE - need;
+        int span = int((need + USABLE_SPACE - 1) / USABLE_SPACE);
+        if (pages + span > limit) return false;
+        pages += span;
+        room = size_t(span) * USABLE_SPACE - need;
         return true;
     }
 };
@@ -344,11 +347,15 @@ struct ExternalSort {
     void close() { readers.clear(); frames.releaseAll(); memory.clear(); runs.clear(); spill.reset(); }
 };
 
-// a sequence of FNV-1a hashes over a value's bytes; numbers hash by value so 1 and 1.0 agree
+// a sequence of FNV-1a hashes over a value's bytes; numbers hash by value so 1 and 1.0 agree, and text by its
+// length and then its bytes, as a record holds it, so the keys ('ab', 'c') and ('a', 'bc') hash apart
 inline uint64_t hashValue(const Value& v, uint64_t h) {
     auto mix = [&](const void* data, size_t n) { for (size_t i = 0; i < n; i++) { h ^= ((const uint8_t*)data)[i]; h *= 1099511628211ULL; } };
-    if (v.isNum) { double d = v.num == 0 ? 0 : v.num; mix(&d, 8); }
-    else mix(v.text.data(), v.text.size());
+    if (v.isNum) { double d = v.num == 0 ? 0 : v.num; mix(&d, 8); return h; }
+    uint8_t length[2];
+    put16(length, uint16_t(v.text.size()));
+    mix(length, 2);
+    mix(v.text.data(), v.text.size());
     return h;
 }
 inline uint64_t hashKey(const Row& row, const std::vector<size_t>& cols, uint64_t seed) {
@@ -428,22 +435,35 @@ struct Limit : Operator {
     void finish() override { children[0]->close(); }
 };
 
-// the right input is opened only when the left is used up, so the two never hold frames at once
+// the right input is read only when the left is used up, so the two never hold frames at once. When a parent
+// writes this output to a temporary file, its writer holds a frame by then, so a right input that holds memory
+// is written to a file of its own first, before the left is opened and before the parent takes that frame
 struct UnionAll : Operator {
-    size_t side = 0;
+    std::unique_ptr<SpillFile> spill;
+    std::unique_ptr<Run> written;
+    std::unique_ptr<TupleSource> right;
     UnionAll(Database& d) : Operator(d, "union_all") {}
-    void start() override { side = 0; children[0]->open(); }
+    void start() override {
+        if (materialize[1]) written = std::make_unique<Run>(materialized(*this, 1, spill));
+        children[0]->open();
+    }
     bool produce(Row& row) override {
-        while (!children[side]->next(row)) {
-            if (side == 1) return false;
+        if (!right) {
+            if (children[0]->next(row)) { widen(row, children[0]->schema, schema); return true; }
             children[0]->close();
-            side = 1;
-            children[1]->open();
+            if (written) right = std::make_unique<RunSource>(db, std::move(*written), children[1]->schema);
+            else right = std::make_unique<ChildSource>(*children[1]);
         }
-        widen(row, children[side]->schema, schema);
+        if (!right->next(row)) return false;
+        widen(row, children[1]->schema, schema);
         return true;
     }
-    void finish() override { children[side]->close(); }
+    void finish() override {
+        if (!right) children[0]->close();
+        right.reset();
+        written.reset();
+        spill.reset();
+    }
 };
 
 struct Sort : Operator {
@@ -590,17 +610,23 @@ struct SortGroupBy : Operator {
 
 // hash mode of distinct and group_by, partitioned like the grace hash join. The groups go into a table that
 // has every frame free beside the input page, and when they all fit that is the only pass. The first group
-// that does not fit sends the table, written out, and the rest of the input to one partition per frame, and
-// each partition is then handled the same way with the next level's hash functions. A partition holds
-// groups, not input tuples: the key columns, then each aggregate's count and its sum or its min or max
+// that does not fit ends the table: it is given up, and the input is read again from its start with every one
+// of those frames the buffer of a partition. The first group of that pass is aggregated as the tuples go past,
+// the way sort mode aggregates its current group, and every tuple of another group goes to the partition its
+// key hashes to. Each partition is then handled the same way with the next level's hash functions. A level
+// that partitions always finishes the group it keeps, so the levels end whatever the keys hash to
 struct HashGrouping {
     Database& db;
-    const std::vector<Col>& inputSchema;
-    std::vector<size_t> keyColumns, keyPositions;
-    const std::vector<Aggregate>& aggs;
+    // the input columns the grouping reads, its keys first and then the aggregates' columns. The table reads
+    // tuples of just these, and the partitions hold them, so a partition's tuple is never longer than an input
+    // tuple. keys are the positions of the keys in such a tuple, and aggs read their columns from it too
+    std::vector<size_t> columns;
+    std::vector<Col> schema, keySchema;
+    std::vector<size_t> keys;
+    std::vector<Aggregate> aggs;
     unsigned long long& comparisons;
-    std::vector<Col> keySchema, stateSchema;
-    // the most an entry's aggregates can take, a VARCHAR min or max at its declared length because it can grow
+    // the most an entry's aggregates can take: a count each, a sum, or a min or max, a VARCHAR one at its
+    // declared length because it can grow
     size_t stateBytes = 0;
     std::unique_ptr<SpillFile> spill;
     Frames frames;
@@ -611,17 +637,23 @@ struct HashGrouping {
     std::deque<std::pair<Run, int>> pending;
     std::vector<std::string> sizes;
 
-    HashGrouping(Database& d, const std::vector<Col>& s, std::vector<size_t> keys, const std::vector<Aggregate>& a, unsigned long long& c)
-        : db(d), inputSchema(s), keyColumns(std::move(keys)), aggs(a), comparisons(c), frames(d.pool) {
-        for (size_t k : keyColumns) { keyPositions.push_back(keySchema.size()); keySchema.push_back(inputSchema[k]); }
-        stateSchema = keySchema;
-        for (const Aggregate& aggregate : aggs) {
-            stateSchema.push_back({"", "count", BigT});
-            if (aggregate.func == "sum" || aggregate.func == "avg") stateSchema.push_back({"", "sum", aggregate.real ? RealT : BigT});
-            if (aggregate.func == "min" || aggregate.func == "max") stateSchema.push_back(inputSchema[size_t(aggregate.column)]);
+    HashGrouping(Database& d, const std::vector<Col>& input, const std::vector<size_t>& keyColumns, std::vector<Aggregate> a, unsigned long long& c)
+        : db(d), columns(keyColumns), aggs(std::move(a)), comparisons(c), frames(d.pool) {
+        for (size_t k = 0; k < columns.size(); k++) { keys.push_back(k); keySchema.push_back(input[columns[k]]); }
+        for (Aggregate& aggregate : aggs) {
+            if (aggregate.column < 0) continue;
+            size_t at = size_t(std::find(columns.begin(), columns.end(), size_t(aggregate.column)) - columns.begin());
+            if (at == columns.size()) columns.push_back(size_t(aggregate.column));
+            aggregate.column = (long long)at;
         }
-        for (size_t i = keySchema.size(); i < stateSchema.size(); i++)
-            stateBytes += stateSchema[i].type == StrT ? 2 + size_t(stateSchema[i].length) : stateSchema[i].type == IntT ? 4 : 8;
+        for (size_t column : columns) schema.push_back(input[column]);
+        for (const Aggregate& aggregate : aggs) {
+            stateBytes += 8;
+            if (aggregate.func == "sum" || aggregate.func == "avg") stateBytes += 8;
+            if (aggregate.func != "min" && aggregate.func != "max") continue;
+            const Col& c = schema[size_t(aggregate.column)];
+            stateBytes += c.type == StrT ? 2 + size_t(c.length) : c.type == IntT ? 4 : 8;
+        }
     }
 
     // the frames free beside the input page, every one of them the table's and then a partition's
@@ -630,81 +662,58 @@ struct HashGrouping {
         work = free;
     }
     uint32_t spillFile() { if (!spill) spill = std::make_unique<SpillFile>(db); return spill->file; }
-    Entry groupOf(const Row& tuple) const {
-        Entry e{{}, std::vector<AggState>(aggs.size())};
-        for (size_t k : keyColumns) e.key.push_back(tuple[k]);
-        accumulate(e.states, aggs, tuple);
-        return e;
-    }
-    Entry entryOf(const Row& record) const {
-        size_t at = keySchema.size();
-        Entry e{Row(record.begin(), record.begin() + at), std::vector<AggState>(aggs.size())};
-        for (size_t i = 0; i < aggs.size(); i++) {
-            AggState& s = e.states[i];
-            s.count = std::stoll(record[at++].text);
-            if ((aggs[i].func == "sum" || aggs[i].func == "avg") && aggs[i].real) s.realSum = record[at++].num;
-            else if (aggs[i].func == "sum" || aggs[i].func == "avg") s.sum = std::stoll(record[at++].text);
-            if (aggs[i].func == "min" || aggs[i].func == "max") s.extreme = record[at++];
-        }
-        return e;
-    }
-    Row recordOf(const Entry& e) const {
-        Row record = e.key;
-        for (size_t i = 0; i < aggs.size(); i++) {
-            record.push_back(intValue(e.states[i].count));
-            if (aggs[i].func == "sum" || aggs[i].func == "avg")
-                record.push_back(aggs[i].real ? realValue(e.states[i].realSum) : intValue(e.states[i].sum));
-            if (aggs[i].func == "min" || aggs[i].func == "max") record.push_back(e.states[i].extreme);
-        }
-        return record;
-    }
-    // a record's key columns come first, so the same positions find the key of an entry and of a record.
-    // The low bits of an FNV-1a hash split the keys the same way whatever the seed, so a partition would
-    // never split again on a power of two frames; murmur3's finaliser makes every bit depend on the seed
-    uint64_t hashOf(const Row& keyFirst, uint64_t seed) const {
-        uint64_t h = hashKey(keyFirst, keyPositions, seed);
+    // The low bits of an FNV-1a hash split the keys the same way whatever the seed, so a partition would never
+    // split again on a power of two frames; murmur3's finaliser makes every bit depend on the seed
+    uint64_t hashOf(const Row& tuple, uint64_t seed) const {
+        uint64_t h = hashKey(tuple, keys, seed);
         h ^= h >> 33; h *= 0xff51afd7ed558ccdULL; h ^= h >> 33; h *= 0xc4ceb9fe1a85ec53ULL; h ^= h >> 33;
         return h;
     }
-    size_t partitionOf(const Row& keyFirst, int level) const { return hashOf(keyFirst, uint64_t(2 * level + 2)) % size_t(work); }
-    // the table written out through one of its own frames, which then all become partition buffers
-    Run writeTable() {
-        RunWriter writer(db, spillFile(), stateSchema, frames.held[0], false);
-        for (const Entry& e : entries) writer.add(recordOf(e));
-        entries.clear();
-        Run table = writer.finish();
-        frames.releaseAll();
-        return table;
+    Entry groupOf(const Row& tuple) const {
+        Entry e{Row(tuple.begin(), tuple.begin() + long(keys.size())), std::vector<AggState>(aggs.size())};
+        accumulate(e.states, aggs, tuple);
+        return e;
     }
-    // one pass over an input at a hash level
+    // the tuple aggregated into its group in the table, false when its group is new and does not fit
+    bool addToTable(const Row& tuple, int level, Packing& pack) {
+        std::vector<int>& bucket = buckets[hashOf(tuple, uint64_t(2 * level + 1)) % buckets.size()];
+        for (int x : bucket) {
+            comparisons++;
+            if (sameKey(entries[size_t(x)].key, keys, tuple, keys)) { accumulate(entries[size_t(x)].states, aggs, tuple); return true; }
+        }
+        Entry e = groupOf(tuple);
+        if (!pack.add(encodedSize(keySchema, e.key) + stateBytes, work)) return false;
+        bucket.push_back(int(entries.size()));
+        entries.push_back(std::move(e));
+        return true;
+    }
+    // one level over an input: the table, and when it does not fit, the second pass that partitions
     void consume(TupleSource& in, int level) {
         frames.take(work);
         buckets.assign(size_t(work) * 64, {});
         Packing pack;
-        Run table;
-        std::vector<std::unique_ptr<RunWriter>> writers;
         Row row;
-        while (in.next(row)) {
-            Entry e = level == 0 ? groupOf(row) : entryOf(row);
-            if (writers.empty()) {
-                std::vector<int>& bucket = buckets[hashOf(e.key, uint64_t(2 * level + 1)) % buckets.size()];
-                int found = -1;
-                for (int x : bucket) { comparisons++; if (same(entries[size_t(x)].key, e.key)) { found = x; break; } }
-                if (found >= 0) { combine(entries[size_t(found)].states, e.states, aggs); continue; }
-                if (pack.add(encodedSize(keySchema, e.key) + stateBytes, work)) { bucket.push_back(int(entries.size())); entries.push_back(std::move(e)); continue; }
-                table = writeTable();
-                for (int p = 0; p < work; p++) writers.push_back(std::make_unique<RunWriter>(db, spillFile(), stateSchema));
-            }
-            writers[partitionOf(e.key, level)]->add(recordOf(e));
+        auto next = [&] {
+            if (!in.next(row)) return false;
+            if (level == 0) { Row picked; for (size_t column : columns) picked.push_back(row[column]); row = std::move(picked); }
+            return true;
+        };
+        bool fits = true;
+        while (fits && next()) fits = addToTable(row, level, pack);
+        if (fits) { in.close(); return; }
+        entries.clear();
+        frames.releaseAll();
+        levels = std::max(levels, level + 1);
+        std::vector<std::unique_ptr<RunWriter>> writers;
+        for (int p = 0; p < work; p++) writers.push_back(std::make_unique<RunWriter>(db, spillFile(), schema));
+        in.rewind();
+        while (next()) {
+            if (entries.empty()) { entries.push_back(groupOf(row)); continue; }
+            comparisons++;
+            if (sameKey(entries[0].key, keys, row, keys)) accumulate(entries[0].states, aggs, row);
+            else writers[hashOf(row, uint64_t(2 * level + 2)) % size_t(work)]->add(row);
         }
         in.close();
-        if (writers.empty()) return;
-        levels = std::max(levels, level + 1);
-        {
-            RunReader reader(db, stateSchema);
-            reader.start(table);
-            while (reader.next(row)) writers[partitionOf(row, level)]->add(row);
-        }
         for (auto& w : writers) {
             Run r = w->finish();
             sizes.push_back(std::to_string(r.pages.size()));
@@ -718,7 +727,7 @@ struct HashGrouping {
         frames.releaseAll();
         auto [run, level] = std::move(pending.front());
         pending.pop_front();
-        RunSource in(db, std::move(run), stateSchema);
+        RunSource in(db, std::move(run), schema);
         consume(in, level);
         return true;
     }
@@ -732,14 +741,13 @@ struct HashGrouping {
 struct HashDistinct : DistinctBase {
     std::unique_ptr<HashGrouping> grouping;
     std::unique_ptr<SpillFile> spill;
-    std::vector<Aggregate> none;
     size_t at = 0;
     HashDistinct(Database& d) : DistinctBase(d, true) {}
     void start() override {
         std::unique_ptr<TupleSource> in = inputOf(*this, 0, spill);
         std::vector<size_t> all;
         for (size_t i = 0; i < schema.size(); i++) all.push_back(i);
-        grouping = std::make_unique<HashGrouping>(db, schema, all, none, counters.comparisons);
+        grouping = std::make_unique<HashGrouping>(db, schema, all, std::vector<Aggregate>(), counters.comparisons);
         grouping->plan(available() - in->framesToCome());
         grouping->consume(*in, 0);
         in.reset();

@@ -206,16 +206,18 @@ temporary file before taking memory itself (DESIGN_M2.md section 2):
 
 ```
 B = 16, peak frames 16
-group_by hash tuples_out=6000 comparisons=8859 reads=199 writes=199 levels=1 partitions=15 spilled_pages=[2,2,2,2,2,2,2,2,2,2,2,2,2,2,2]
+group_by hash tuples_out=6000 comparisons=14856 reads=268 writes=169 levels=1 partitions=15 spilled_pages=[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]
   hash_join tuples_out=6000 comparisons=25320 reads=168 writes=168 partitions=14 pages_left/right=[6/6,...] overflowed=0
     seqscan R6000 tuples_out=6000 comparisons=0 reads=81 writes=0
     seqscan S6000 tuples_out=6000 comparisons=0 reads=81 writes=0
 ```
 
-The group_by's own 199 writes are 154 pages of join output (6000 tuples of 100 bytes, 39 to a page)
-written once, the 15 pages of its table written out when the 6000 groups did not fit in its 15 frames,
-and 30 pages of partitions. Its 199 reads are the same pages read back. So the materialisation costs
-2 × 154 = 308 page I/Os here, 34% of the plan's 896. A fully pipelined executor would not pay that, but
+The group_by's own 169 writes are 154 pages of join output (6000 tuples of 100 bytes, 39 to a page)
+written once, and 15 pages of partitions. Its 6000 groups did not fit in its 15 frames, so it read the
+join output again and split it 15 ways, keeping only the 4 byte key it groups on, one page a partition.
+Its 268 reads are the 154 pages read back, the first 99 of them read once more before that while its
+table filled, and the 15 partitions. So the materialisation costs 2 × 154 = 308 page I/Os here, 33% of
+the plan's 935. A fully pipelined executor would not pay that, but
 it would have needed two operators holding memory at once. Note also that the join runs with 14
 partitions, not 15, because it leaves one frame for the group_by's writer. At B = 8 that left it 6
 partitions of 13 to 15 pages, which all overflowed (6 million comparisons), so the frame matters most
@@ -224,37 +226,41 @@ when memory is tight.
 ## 7 Hash distinct against its formula
 
 A hash distinct of R, all of whose tuples differ, so its groups take as many pages as its input. The
-formula is that of DESIGN_M2.md section 6 with R = G = N, and the I/O is the operator's own, beyond the
-scan of its input:
+formula is that of DESIGN_M2.md section 6 with R = G = N and read(x) = N, and the I/O is the whole
+plan's: the scan's reads, which include the input read again when a level partitions, and the
+distinct's own:
 
-| N pages | B | levels | partitions per split | own reads | own writes | own I/O | formula | measured / formula |
-|---|---|---|---|---|---|---|---|---|
-| 80 | 4 | 4 | 3 | 364 | 364 | 728 | 564 | 1.29 |
-| 80 | 8 | 2 | 7 | 238 | 238 | 476 | 476 | 1.00 |
-| 80 | 16 | 1 | 15 | 102 | 102 | 204 | 210 | 0.97 |
-| 80 | 64 | 1 | 63 | 188 | 188 | 376 | 378 | 0.99 |
-| 80 | 256 | 0 | 255 | 0 | 0 | 0 | 0 | both 0 |
-| 320 | 4 | 5 | 3 | 2182 | 2182 | 4364 | 4284 | 1.02 |
-| 320 | 8 | 3 | 7 | 796 | 796 | 1592 | 1442 | 1.10 |
-| 320 | 16 | 2 | 15 | 1017 | 1017 | 2034 | 2040 | 1.00 |
-| 320 | 64 | 1 | 63 | 414 | 414 | 828 | 882 | 0.94 |
-| 320 | 256 | 1 | 255 | 757 | 757 | 1514 | 1530 | 0.99 |
+| N pages | B | levels | partitions per split | scan reads | own reads | own writes | total I/O | formula | measured / formula |
+|---|---|---|---|---|---|---|---|---|---|
+| 80 | 4 | 4 | 3 | 86 | 405 | 313 | 804 | 617 | 1.30 |
+| 80 | 8 | 2 | 7 | 90 | 238 | 182 | 510 | 507 | 1.01 |
+| 80 | 16 | 1 | 15 | 98 | 89 | 89 | 276 | 275 | 1.00 |
+| 80 | 64 | 1 | 63 | 146 | 125 | 125 | 396 | 395 | 1.00 |
+| 80 | 256 | 0 | 255 | 81 | 0 | 0 | 81 | 80 | 1.01 |
+| 320 | 4 | 5 | 3 | 326 | 2294 | 1814 | 4434 | 4361 | 1.02 |
+| 320 | 8 | 3 | 7 | 330 | 775 | 695 | 1800 | 1713 | 1.05 |
+| 320 | 16 | 2 | 15 | 338 | 1016 | 776 | 2130 | 2135 | 1.00 |
+| 320 | 64 | 1 | 63 | 386 | 350 | 350 | 1086 | 1139 | 0.95 |
+| 320 | 256 | 1 | 255 | 578 | 503 | 503 | 1584 | 1595 | 0.99 |
 
 **One level of partitions is the normal case.** Every split uses all B − 1 frames, so a single level
-suffices once (B − 1)² ≥ N: from B = 16 at N = 80 and from B = 64 at N = 320. The reads equal the
-writes in every row, because every page written is read back once. In eight of the ten rows the
-measurement is within 6% of the formula. The formula assumes that a level's partitions are the same
-size. At N = 80, B = 4 the third level writes 27 partitions that it expects at 80 / 27 = 2.96 pages,
-just under the 3 frames. With their part-full pages, 9 of the 27 came out at 4 pages and needed a
-fourth level, which is the 29%. N = 320 at B = 8 is the same effect, smaller. Where the measurement is
-below the formula, the formula has rounded every partition up: at N = 320, B = 64 it counts 6 pages
-for each of the 63 partitions, and 27 of them took 5. The executor this replaced gave the table and the
-partition buffers half the frames each, which is one partition at B = 4 and two at B = 5. Each level
-then took out only the groups that fit in the table and wrote the rest again, so the I/O grew with the
-square of the input. At B = 4,
-`SELECT DISTINCT eid, pid, hours FROM Works` on the scale 5 data (59 pages) cost 3058 page I/Os that
-way. This executor's hash distinct costs 546, against 414 for the sort, and the optimizer, whose
-estimates for the two are now 545 and 413, picks the sort.
+suffices once (B − 1)² ≥ N: from B = 16 at N = 80 and from B = 64 at N = 320. A level that partitions
+reads its input again. So the scan reads B + 1 pages more than its 81 or 321: the B data pages it read
+until the table was full, every tuple being a new group, and its directory page once more.
+The distinct's own reads equal its writes in the rows with one level, because every partition written is
+read back once. With more levels its reads are higher, by the pages each lower level reads before its
+table fills. In eight of the ten rows the measurement is within 5% of the formula. The formula assumes
+that a level's partitions are the same size. At N = 80, B = 4 the third level writes 27 partitions that
+it expects at 80 / 27 = 2.96 pages, just under the 3 frames. With their part-full pages, 11 of the 27
+came out at 4 pages and needed a fourth level, which is the 30%. N = 320 at B = 8 is the same effect,
+smaller: 3 of the 49 second level partitions came out at 8 pages, over the 7 frames. Where the
+measurement is below the formula, the formula has rounded every partition up: at N = 320, B = 64 it
+counts 6 pages for each of the 63 partitions, and 28 of them took 5. The executor before the last one
+gave the table and the partition buffers half the frames each, which is one partition at B = 4 and two
+at B = 5. Each level then took out only the groups that fit in the table and wrote the rest again, so
+the I/O grew with the square of the input. At B = 4, `SELECT DISTINCT eid, pid, hours FROM Works` on the
+scale 5 data (59 pages) cost 3058 page I/Os that way. This executor's hash distinct costs 521, against
+414 for the sort, and the optimizer, whose estimates for the two are 518 and 413, picks the sort.
 
 ## 8 Sources
 

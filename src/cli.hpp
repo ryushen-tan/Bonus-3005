@@ -3,9 +3,11 @@
 #include "catalog.hpp"
 #include "json.hpp"
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <iterator>
 #include <map>
+#include <pthread.h>
 #include <set>
 
 // a command, then --name value options and bare --flags
@@ -91,4 +93,21 @@ inline int report(const Error& e, std::ostream& out) {
     if (e.line) out << " at line " << e.line << " col " << e.col;
     out << '\n';
     return 1;
+}
+
+// the parsers, the optimizer's passes and the operators recurse once per level of a plan, and the deepest
+// plans the limits of GRAMMAR_SQL.md section 5 allow need more than the 8 MB stack of a main thread in a
+// sanitizer build, so the tools that read SQL or plans do their work on a thread with a stack of this size
+constexpr size_t TOOL_STACK_BYTES = size_t(1) << 30;
+inline int onLargeStack(std::ostream& out, const std::function<int()>& work) {
+    struct Job { const std::function<int()>& work; int code; } job{work, 1};
+    pthread_attr_t attributes;
+    pthread_attr_init(&attributes);
+    int failure = pthread_attr_setstacksize(&attributes, TOOL_STACK_BYTES);
+    pthread_t thread;
+    if (!failure) failure = pthread_create(&thread, &attributes, [](void* arg) -> void* { Job& j = *static_cast<Job*>(arg); j.code = j.work(); return nullptr; }, &job);
+    pthread_attr_destroy(&attributes);
+    if (failure) return report(Error{std::string("internal error: cannot start a thread with a large stack: ") + std::strerror(failure)}, out);
+    pthread_join(thread, nullptr);
+    return job.code;
 }

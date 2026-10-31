@@ -31,12 +31,13 @@ def join(alg, l, r, cond): return {'op': alg, 'condition': cond, 'left': scan(l)
 
 def passes(n, b): return 1 if math.ceil(n / b) <= 1 else 1 + math.ceil(math.log(math.ceil(n / b)) / math.log(b - 1))
 def sort_cost(m, b): return 2 * m * (passes(m, b) - 1) + m
-# hash distinct and group_by, DESIGN_M2.md section 6: the I/O of its own beyond reading the input, for
-# records pages of group records whose groups take group_pages
-def hash_grouping_cost(records, group_pages, b):
-    work, cost, inputs = b - 1, 0, 1
+# hash distinct and group_by, DESIGN_M2.md section 6, the reads of its input included: read_pages to read the
+# input, tuple_pages of its tuples as the partitions hold them, and group_pages of groups
+def hash_grouping_cost(read_pages, tuple_pages, group_pages, b):
+    work, cost, inputs = b - 1, read_pages, 1
     while group_pages / inputs > work:
-        cost += 2 * work * inputs + 2 * inputs * work * math.ceil(records / (inputs * work))
+        each = read_pages if inputs == 1 else math.ceil(tuple_pages / inputs)
+        cost += inputs * math.ceil(each * work * inputs / group_pages) + 2 * work * inputs * math.ceil(tuple_pages / (work * inputs))
         inputs *= work
     return cost
 def formula(alg, m, n, b):
@@ -156,17 +157,17 @@ def main():
         print('B = %d, peak frames %d:\n\n```\n%s```\n' % (b, t['peak_frames'], trace))
 
     print('## 7 Hash distinct against its formula\n')
-    print('A hash distinct of R, whose tuples are all different, so the groups take as many pages as the input. Its own reads and writes, and the formula of DESIGN_M2.md section 6.\n')
-    print('| N pages | B | levels | partitions per split | own reads | own writes | own I/O | formula | measured / formula |')
-    print('|---|---|---|---|---|---|---|---|---|')
+    print('A hash distinct of R, whose tuples are all different, so the groups take as many pages as the input. The scan\'s reads, which include the input read again when a level partitions, the distinct\'s own reads and writes, and the formula of DESIGN_M2.md section 6.\n')
+    print('| N pages | B | levels | partitions per split | scan reads | own reads | own writes | total I/O | formula | measured / formula |')
+    print('|---|---|---|---|---|---|---|---|---|---|')
     for n_tuples in [6000, 24000]:
         n = sizes[n_tuples][0]
         for b in [4, 8, 16, 64, 256]:
             _, trace = plan({'op': 'distinct', 'mode': 'hash', 'child': scan('R%d' % n_tuples)}, b)
-            line = trace.splitlines()[0]
-            field = lambda name: int(line.split(name + '=')[1].split()[0])
-            own, f = field('reads') + field('writes'), hash_grouping_cost(n, n, b)
-            print('| %d | %d | %d | %d | %d | %d | %d | %d | %s |' % (n, b, field('levels'), field('partitions'), field('reads'), field('writes'), own, f, '%.2f' % (own / f) if f else 'both 0'))
+            line, scan_line = trace.splitlines()[0], trace.splitlines()[1]
+            field = lambda text, name: int(text.split(name + '=')[1].split()[0])
+            total, f = field(scan_line, 'reads') + field(line, 'reads') + field(line, 'writes'), hash_grouping_cost(n, n, n, b)
+            print('| %d | %d | %d | %d | %d | %d | %d | %d | %d | %.2f |' % (n, b, field(line, 'levels'), field(line, 'partitions'), field(scan_line, 'reads'), field(line, 'reads'), field(line, 'writes'), total, f, total / f))
     shutil.rmtree(DB)
     os.remove(OUT + '/plan.json')
 

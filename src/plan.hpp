@@ -84,16 +84,18 @@ inline void equalityKeys(const Node& c, size_t leftWidth, JoinCondition& join) {
     join.right.push_back(r - leftWidth);
 }
 
-// the operators that will hold memory while a parent writes this input to a temporary file must leave the
-// parent's output frame free; pipelined operators pass that on to their inputs
-inline void leaveFrameForParent(Operator& op) {
-    if (op.holdsMemory()) { op.parentFrames = 1; return; }
-    for (auto& c : op.children) leaveFrameForParent(*c);
-}
 inline bool writtenBelow(const Operator& op) {
     if (op.writtenForParent()) return true;
     for (const auto& c : op.children) if (writtenBelow(*c)) return true;
     return false;
+}
+// the operators that will hold memory while a parent writes this input to a temporary file must leave the
+// parent's output frame free; pipelined operators pass that on to their inputs. A union_all on the way writes
+// a right input that holds memory to its own file first, whose frame that input must leave free in the same way
+inline void leaveFrameForParent(Operator& op) {
+    if (op.holdsMemory()) { op.parentFrames = 1; return; }
+    if (op.op == "union_all") op.materialize[1] = writtenBelow(*op.children[1]);
+    for (auto& c : op.children) leaveFrameForParent(*c);
 }
 
 inline std::unique_ptr<Operator> buildNode(Database& db, const Json& j, const std::string& path) {
@@ -263,10 +265,8 @@ inline int execTool(const std::vector<std::string>& args, std::ostream& out) {
         Args a = parseArgs(args, {"json"});
         if (a.command != "run" && a.command != "trace") { out << usage; return 2; }
         a.allow({"db", "plan", "frames", "policy", "json"});
-        int frames = a.number("frames", 32);
-        if (frames < 1) throw Error{"error: --frames must be at least 1"};
         Json plan = parseJson(readFile(a.need("plan")));
-        std::unique_ptr<Database> db = openDatabase(a.need("db"), frames, policyNamed(a.get("policy", "clock")));
+        std::unique_ptr<Database> db = openDatabase(a.need("db"), a.number("frames", 32), policyNamed(a.get("policy", "clock")));
         std::unique_ptr<Operator> root = buildPlan(*db, plan);
         Result r = execute(*db, *root);
         if (a.command == "trace") printTrace(*root, out);

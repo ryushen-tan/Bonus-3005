@@ -19,7 +19,8 @@ struct PageId {
 struct IoCounters { unsigned long long reads = 0, writes = 0; };
 
 struct DiskManager {
-    struct File { std::string path; int fd; uint32_t pages; };
+    // unopened: why the file could not be opened, given as the error of every use of it
+    struct File { std::string path; int fd; uint32_t pages; std::string unopened; };
     std::vector<File> files;
     IoCounters total;
     // the executor points this at the operator that is running, so its own temporary files are charged to it
@@ -30,26 +31,26 @@ struct DiskManager {
     ~DiskManager() { for (File& f : files) if (f.fd >= 0) ::close(f.fd); }
 
     [[noreturn]] static void fail(const std::string& what, const std::string& path) { throw Error{"io error: " + what + " " + path + ": " + std::strerror(errno)}; }
-    // only a file that exists, so a missing table file is an error rather than a new empty table
+    // only a file that exists, so a missing table file is an error rather than a new empty table. The error is
+    // given when the file is first used, so the other tables of a database with a missing file still work
     uint32_t open(const std::string& path) {
         int fd = ::open(path.c_str(), O_RDWR);
-        if (fd < 0) fail("cannot open", path);
-        off_t size = ::lseek(fd, 0, SEEK_END);
-        files.push_back({path, fd, uint32_t(size / PAGE_SIZE)});
+        if (fd < 0) files.push_back({path, fd, 0, "io error: cannot open " + path + ": " + std::strerror(errno)});
+        else files.push_back({path, fd, uint32_t(::lseek(fd, 0, SEEK_END) / PAGE_SIZE), ""});
         return uint32_t(files.size() - 1);
     }
     // a file that must not exist yet, so that creating one never overwrites another
     uint32_t create(const std::string& path) {
         int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL, 0644);
         if (fd < 0) fail("cannot create", path);
-        files.push_back({path, fd, 0});
+        files.push_back({path, fd, 0, ""});
         return uint32_t(files.size() - 1);
     }
     uint32_t createTemp(const std::string& dir) {
         std::string path = dir + "/.tmp-XXXXXX";
         int fd = ::mkstemp(path.data());
         if (fd < 0) fail("cannot create a temporary file in", dir);
-        files.push_back({path, fd, 0});
+        files.push_back({path, fd, 0, ""});
         return uint32_t(files.size() - 1);
     }
     void close(uint32_t file) {
@@ -61,9 +62,12 @@ struct DiskManager {
         close(file);
     }
     // rename(2) replaces the file at path in one step, so a reader finds the old file or the new one. The file
-    // renamed is a temporary one, which mkstemp made 0600, so it first gets the mode of every other file
+    // renamed is a temporary one, which mkstemp made 0600, so it first gets the mode create gives every other
+    // file: 0644 less the umask, which umask(2) can only read by setting it, so it is set back at once
     void rename(uint32_t file, const std::string& path) {
-        if (::fchmod(files[file].fd, 0644) != 0) fail("cannot set the mode of", files[file].path);
+        mode_t mask = ::umask(0);
+        ::umask(mask);
+        if (::fchmod(files[file].fd, 0644 & ~mask) != 0) fail("cannot set the mode of", files[file].path);
         if (::rename(files[file].path.c_str(), path.c_str()) != 0) fail("cannot rename " + files[file].path + " to", path);
         files[file].path = path;
     }
@@ -75,8 +79,12 @@ struct DiskManager {
         (write ? total.writes : total.reads)++;
         if (attributed) (write ? attributed->writes : attributed->reads)++;
     }
+    File& usable(uint32_t file) {
+        if (!files[file].unopened.empty()) throw Error{files[file].unopened};
+        return files[file];
+    }
     void readPage(PageId id, uint8_t* out) {
-        const File& file = files[id.file];
+        const File& file = usable(id.file);
         if (id.page >= file.pages) throw Error{"io error: " + file.path + " has " + std::to_string(file.pages) + " pages, there is no page " + std::to_string(id.page)};
         ssize_t n = ::pread(file.fd, out, PAGE_SIZE, off_t(id.page) * PAGE_SIZE);
         if (n < 0) fail("cannot read", file.path);
@@ -84,11 +92,12 @@ struct DiskManager {
         count(false);
     }
     void writePage(PageId id, const uint8_t* data) {
-        if (::pwrite(files[id.file].fd, data, PAGE_SIZE, off_t(id.page) * PAGE_SIZE) != PAGE_SIZE) fail("cannot write", files[id.file].path);
+        const File& file = usable(id.file);
+        if (::pwrite(file.fd, data, PAGE_SIZE, off_t(id.page) * PAGE_SIZE) != PAGE_SIZE) fail("cannot write", file.path);
         count(true);
     }
-    uint32_t allocatePage(uint32_t file) { return files[file].pages++; }
-    uint32_t numPages(uint32_t file) const { return files[file].pages; }
+    uint32_t allocatePage(uint32_t file) { return usable(file).pages++; }
+    uint32_t numPages(uint32_t file) { return usable(file).pages; }
 };
 
 inline void createDirectories(const std::string& dir) {

@@ -98,7 +98,7 @@ comparable types in each position (case 14), and the output takes the left input
 checks the number of values, each value's type against its column, that an INT fits in 32 bits and that
 a string fits its VARCHAR. Every integer literal is an INT, so one outside -2147483648 to 2147483647 is a
 type error that says so, also in a comparison (`WHERE a < 3000000000`), where PostgreSQL would make it
-a BIGINT.
+a BIGINT. A literal is judged by its value, as the loader judges a field, so `000000000001` is the INT 1.
 
 ## 4 Aggregation rules
 
@@ -142,7 +142,9 @@ decisions:
    `project [Emp.name] / sort [Emp.age desc] / project [Emp.name, Emp.age] / scan Emp`.
 7. LIMIT: a `limit`.
 8. The set operators between whole terms, left associative. `ORDER BY` and `LIMIT` after the last term
-   then apply to the result of the set operations (GRAMMAR_SQL.md section 4).
+   then apply to the result of the set operations (GRAMMAR_SQL.md section 4). A parenthesised query on
+   its own is not a set operation: the parser folds `(SELECT ...) ORDER BY ... LIMIT ...` into the
+   query inside, so its ORDER BY and LIMIT are steps 6 and 7 of that block, as in PostgreSQL.
 
 Conditions are written into the plan as text in Bonus Project 1's condition language (`and`, `or`,
 `not`, `!=`). The text is printed from a Bonus 1 condition tree, built from the SQL condition after
@@ -157,8 +159,17 @@ Everything is reported as `error: <category>: <message> at line L, column C` wit
 categories (lexical, syntax, name, ambiguity, type, aggregate, schema), at the first error, with no stack
 trace. `sql check` prints nothing and exits 0 when the file is correct, and prints the error and exits 1
 otherwise. A statement past the limits of GRAMMAR_SQL.md section 5 (450 levels of nesting, 1000
-comparisons in a condition, 1000 set operators) is a syntax error in the same form, never a crash. In a script, `CREATE TABLE` adds the table to what later statements see, without touching the
-database, so a file that creates a table and then queries it compiles.
+comparisons in a condition, 1000 set operators, 16 tables in a FROM clause) is a syntax error in the
+same form, never a crash. The plan a statement within them becomes, and the one the optimizer makes of
+it, are accepted by `opt` and `exec`, whose JSON reader's depth limit is computed from these limits
+(GRAMMAR_SQL.md section 5, which also has the one exception, a nest of blocks with rule 7 off).
+
+In a script, `CREATE TABLE` adds the table to what later statements see, without touching the
+database, so a file that creates a table and then queries it compiles. A `CREATE TABLE` is also
+checked by the catalog's own rules for the name of a new table (`tableNameProblem` in `catalog.hpp`):
+a table is a file, so its name is at most 252 characters, never `catalog` in any case, and never an
+existing table's name in another case. So `sql check`, `sql compile` and the shell refuse
+`CREATE TABLE dept (x INT)` beside `Dept` alike, as a name error at the table's name.
 
 ## 7 Sources and what they changed
 

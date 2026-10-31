@@ -80,11 +80,12 @@ allows and ignores, and which `EXPLAIN ANALYZE` puts beside the actual counts. T
 is that every plan M4 emits runs in M2 unedited. The optimizer tests and the end to end run do that
 for 68 queries at several values of B.
 
-**The memory contract across M2 and M4.** M2 guarantees any plan of B ≥ 4 frames runs within them, so
-M4 never has to check that a plan fits. M4's cost model uses the same formulas as M2's operators, with
-the frames M2 gives each one: B, or B − 1 below an operator that holds memory, which keeps a frame free
-to write that input to a temporary file (DESIGN_M4.md section 4). Where M2 spends I/O the formulas do
-not count, that is measured in REPORT_M2.md rather than hidden.
+**The memory contract across M2 and M4.** M2 guarantees any plan of B ≥ 4 frames runs within them, so M4
+never has to check that a plan fits. M4's cost model uses the same formulas as M2's operators, with the
+frames M2 gives each one: B, or B − 1 below an operator that holds memory, which keeps a frame free to
+write that input to a temporary file (DESIGN_M4.md section 4). A group_by with no keys holds none, and a
+hash grouping is sized as M2 packs it, each group at its declared length with a slot. Where M2 spends
+I/O the formulas do not count, that is measured in REPORT_M2.md rather than hidden.
 
 ## What I would do differently
 

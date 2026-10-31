@@ -104,25 +104,25 @@ SELECT e.name, p.name, w.hours FROM Emp e JOIN Works w ON e.eid = w.eid JOIN Pro
 {e,w,p,d}  rows=375 pages=9    {w,p,d} outer, sort_merge_join with e inner  cost=276
 ```
 ```
-project [e.name, p.name, w.hours]           est_rows=375      est_cost=0
-  nested_loop_join (e.eid = w.eid)          est_rows=375      est_cost=56
-    project [p.name, w.eid, w.hours]        est_rows=375      est_cost=0
-      nested_loop_join (w.pid = p.pid)      est_rows=375      est_cost=60
-        project [p.pid, p.name]             est_rows=100      est_cost=0
-          nested_loop_join (p.did = d.did)  est_rows=100      est_cost=4
-            project [p.pid, p.did, p.name]  est_rows=500      est_cost=0
-              rename p                      est_rows=500      est_cost=0
-                seqscan Proj                est_rows=500      est_cost=3
-            project [d.did]                 est_rows=10       est_cost=0
-              filter (d.city = 'Ottawa')    est_rows=10       est_cost=0
-                rename d                    est_rows=50       est_cost=0
-                  seqscan Dept              est_rows=50       est_cost=1
-        filter (w.hours > 35)               est_rows=1875     est_cost=0
-          rename w                          est_rows=15000    est_cost=0
-            seqscan Works                   est_rows=15000    est_cost=59
-    project [e.eid, e.name]                 est_rows=5000     est_cost=0
-      rename e                              est_rows=5000     est_cost=0
-        seqscan Emp                         est_rows=5000     est_cost=54
+project [e.name, p.name, w.hours] est_rows=375 est_cost=0
+  nested_loop_join (e.eid = w.eid) est_rows=375 est_cost=56
+    project [p.name, w.eid, w.hours] est_rows=375 est_cost=0
+      nested_loop_join (w.pid = p.pid) est_rows=375 est_cost=60
+        project [p.pid, p.name] est_rows=100 est_cost=0
+          nested_loop_join (p.did = d.did) est_rows=100 est_cost=4
+            project [p.pid, p.did, p.name] est_rows=500 est_cost=0
+              rename p est_rows=500 est_cost=0
+                seqscan Proj est_rows=500 est_cost=3
+            project [d.did] est_rows=10 est_cost=0
+              filter (d.city = 'Ottawa') est_rows=10 est_cost=0
+                rename d est_rows=50 est_cost=0
+                  seqscan Dept est_rows=50 est_cost=1
+        filter (w.hours > 35) est_rows=1875 est_cost=0
+          rename w est_rows=15000 est_cost=0
+            seqscan Works est_rows=15000 est_cost=59
+    project [e.eid, e.name] est_rows=5000 est_cost=0
+      rename e est_rows=5000 est_cost=0
+        seqscan Emp est_rows=5000 est_cost=54
 total est_cost=120
 ```
 
@@ -154,15 +154,15 @@ ANALYZE Works: 60000 tuples, 236 pages
 
 ```
 SELECT e.name, e.city, e.age, e.did, e.mgr, w.hours FROM Emp e JOIN Works w ON e.eid = w.eid WHERE e.level = 8 AND e.salary > 160000;
-project [e.name, e.city, e.age, e.did, e.mgr, w.hours]    est_rows=889      est_cost=0
-  nested_loop_join (e.eid = w.eid)                        est_rows=889      est_cost=691
-    project [e.eid, e.name, e.age, e.did, e.mgr, e.city]  est_rows=282      est_cost=0
-      filter (e.level = 8 and e.salary > 160000)          est_rows=282      est_cost=0
-        rename e                                          est_rows=20000    est_cost=0
-          seqscan Emp                                     est_rows=20000    est_cost=219
-    project [w.eid, w.hours]                              est_rows=60000    est_cost=0
-      rename w                                            est_rows=60000    est_cost=0
-        seqscan Works                                     est_rows=60000    est_cost=236
+project [e.name, e.city, e.age, e.did, e.mgr, w.hours] est_rows=889 est_cost=0
+  nested_loop_join (e.eid = w.eid) est_rows=889 est_cost=691
+    project [e.eid, e.name, e.age, e.did, e.mgr, e.city] est_rows=282 est_cost=0
+      filter (e.level = 8 and e.salary > 160000) est_rows=282 est_cost=0
+        rename e est_rows=20000 est_cost=0
+          seqscan Emp est_rows=20000 est_cost=219
+    project [w.eid, w.hours] est_rows=60000 est_cost=0
+      rename w est_rows=60000 est_cost=0
+        seqscan Works est_rows=60000 est_cost=236
 total est_cost=691
 ```
 ```
@@ -179,15 +179,15 @@ project tuples_out=7409 comparisons=0 reads=0 writes=0
 
 ```
 SELECT e.name, e.city, e.age, e.did, e.mgr, w.hours FROM Emp e JOIN Works w ON e.eid = w.eid WHERE e.salary > 160000;
-project [e.name, e.city, e.age, e.did, e.mgr, w.hours]    est_rows=7093     est_cost=0
-  hash_join (e.eid = w.eid)                               est_rows=7093     est_cost=727
-    project [e.eid, e.name, e.age, e.did, e.mgr, e.city]  est_rows=2250     est_cost=0
-      filter (e.salary > 160000)                          est_rows=2250     est_cost=0
-        rename e                                          est_rows=20000    est_cost=0
-          seqscan Emp                                     est_rows=20000    est_cost=219
-    project [w.eid, w.hours]                              est_rows=60000    est_cost=0
-      rename w                                            est_rows=60000    est_cost=0
-        seqscan Works                                     est_rows=60000    est_cost=236
+project [e.name, e.city, e.age, e.did, e.mgr, w.hours] est_rows=7093 est_cost=0
+  hash_join (e.eid = w.eid) est_rows=7093 est_cost=727
+    project [e.eid, e.name, e.age, e.did, e.mgr, e.city] est_rows=2250 est_cost=0
+      filter (e.salary > 160000) est_rows=2250 est_cost=0
+        rename e est_rows=20000 est_cost=0
+          seqscan Emp est_rows=20000 est_cost=219
+    project [w.eid, w.hours] est_rows=60000 est_cost=0
+      rename w est_rows=60000 est_cost=0
+        seqscan Works est_rows=60000 est_cost=236
 total est_cost=727
 ```
 ```

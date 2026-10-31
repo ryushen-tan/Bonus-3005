@@ -3,10 +3,11 @@
 #include "cli.hpp"
 #include "sqlplan.hpp"
 
-// the tables of an existing database, without changing it
+// the tables of an existing database and its rules for the name of a new one, without changing it
 inline SqlCompiler compilerFor(Database& db) {
     SqlCompiler c;
     c.tables = [&db](const std::string& name) -> const std::vector<Col>* { Table* t = db.find(name); return t ? &t->cols : nullptr; };
+    c.tableNameProblem = [&db](const std::string& name) { return db.tableNameProblem(name); };
     return c;
 }
 

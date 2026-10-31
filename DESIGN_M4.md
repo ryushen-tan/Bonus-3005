@@ -3,7 +3,7 @@
 Code: `src/optimizer.hpp` (ANALYZE, estimates, the rules, the cost model, join enumeration, physical plan
 output), `src/opt.hpp` (the `opt` tool). Tests: `tests/test_opt.cpp`. These check that the worked
 examples of sections 2, 3 and 5.1 reproduce, and that every item of the checklist holds. They also run
-24 SQL queries through all four modules at B = 4, 8 and 32, optimised and unoptimised, and require the
+25 SQL queries through all four modules at B = 4, 8 and 32, optimised and unoptimised, and require the
 same rows, and they test the `db` shell. `tests/e2e/run.py` checks 44 queries against PostgreSQL, through
 the four tools chained by file and through the shell.
 
@@ -26,7 +26,9 @@ column's own temporary run, through one frame per column. Each run then goes thr
 external sort. The sorted stream gives ndv, min and max, and the histogram is cut on the fly: value
 number i (from 0) of n goes into bucket floor(i · k / n), so bucket sizes differ by at most one. That
 is "cutting at every n/k-th value", and it means a heavy value spans several buckets rather than
-distorting one. ANALYZE needs one frame per column plus three, and it says so when B is too small.
+distorting one. ANALYZE needs one frame per column and one for the scan while it reads the table, and
+three for each column's sort after that, so the larger of the columns + 1 and 3. It says so when B is
+too small (measured: 8 columns need 9 frames, and 1 or 2 columns need 3).
 
 The statistics are records of kinds 3, 4 and 5 in `catalog.db` (DESIGN_M1.md section 6): one per
 table, one per column, one per histogram bucket. Values are stored as text and turned back into values
@@ -100,6 +102,15 @@ is how REPORT_M4.md measures what each is worth.
 The worked example of section 3 reproduces exactly (test `section 3 rewrite example reproduces`), and
 `opt explain --rewrites` prints the plan before and after.
 
+Rules 3 and 7 and the join order merge conjuncts of different conditions into one: a join's condition
+can hold an ON condition and the WHERE's equalities, and a filter the WHERE and a HAVING moved down by
+rule 5. A condition is written into the plan in Module 2's condition language, whose parser takes a
+condition at most 2000 levels tall, so a merged condition is cut into as few conditions as hold its
+conjuncts (`conjunctions`): what does not fit into a join's condition is a filter straight above the
+join, and two adjacent selects stay apart when they do not fit into one. Every condition of the SQL
+front end fits on its own (1000 comparisons inside 450 levels of nesting), so only a merge of more
+than 1000 comparisons is ever cut.
+
 ## 4 Cost model
 
 Cost is page I/O. M and N are the estimated pages of a node's inputs, B the frames. These are the
@@ -112,14 +123,16 @@ operator that holds memory. Module 2 writes an input that holds memory to a temp
 operator above it takes its own memory (DESIGN_M2.md section 2), and that input must leave the file's
 output frame free: a sort there makes runs of B − 1 pages and merges B − 2 at a time, and a nested loop
 there has a block of B − 3 pages. In a left-deep join block, every join but the top one is below another
-join. At the top of a plan F = B, and the formulas are exactly the module's.
+join. A group_by with no keys holds no memory, since it aggregates its one group as the input streams
+past, so its input works in the same F as the group_by. At the top of a plan F = B, and the formulas are
+exactly the module's.
 
 | operator | own cost | module formula |
 |---|---|---|
 | seqscan | n_pages(T) | M |
 | filter, project, rename, limit, union_all | 0 | 0 |
 | sort | read(x) + 2 · pages(x) · (passes − 1), passes = 1 + ceil(log(ceil(M / F)) / log(F − 1)) | 2M(passes − 1) + M |
-| distinct, group_by | the cheaper of the sort, or hashing. For hashing, R is the pages of one group record per input tuple: pages(x) for distinct; for group_by, rows(x) × (the keys' widths + 8 per aggregate, + 8 more for sum and avg, + the column's width for min and max) / 4096. G = R · groups / rows(x), and W is the memory − 1 frames beside the input page. The cost is read(x) when G ≤ W, else read(x) + Σ over k = 0, 1, … while G / W^k > W of 2W · W^k + 2W^(k+1) · ceil(R / W^(k+1)). With no keys, read(x) | cost of the sort or the hash partitioning (DESIGN_M2 §6) |
+| distinct, group_by | the cheaper of the sort, or hashing. For hashing, sizes are counted as Module 2 counts them, each record with its 4 byte slot in the 4088 usable bytes of a page. G is the pages of the groups, each the keys' widths + 8 per aggregate, + 8 more for sum and avg, + the declared length of the column for min and max (2 + n for a VARCHAR(n)); R is the pages of rows(x) input tuples of just the keys and the aggregated columns; W is the F − 1 frames beside the input page. The cost is read(x) when G ≤ W, else read(x) + Σ over k = 0, 1, … while G / W^k > W of W^k · ceil(r_k · W^(k+1) / G) + 2W^(k+1) · ceil(R / W^(k+1)), with r_0 = read(x) and r_k = ceil(R / W^k): each input read until its table is full, then partitioned. With no keys, read(x) | cost of the sort or the hash partitioning (DESIGN_M2 §6) |
 | nested_loop_join | read(outer) + ceil(pages(outer) / (F − 2)) · read(inner) | M + ceil(M / (B − 2)) · N |
 | sort_merge_join | sortcost(outer) + sortcost(inner) + pages(outer) + pages(inner) | sort(M) + sort(N) + M + N |
 | hash_join | read(outer) + read(inner) + 2 · (pages(outer) + pages(inner)) | 3(M + N) |
@@ -139,7 +152,9 @@ the module's explain example does, and the plan's total on the last line.
 Module 2 gives each operator. REPORT_M2.md measures where the executor's real I/O departs from them:
 - one directory page per scan;
 - part-full partition pages in the hash join;
-- uneven hash-grouping partitions, which can need one level more than the formula (REPORT_M2 §7);
+- uneven hash-grouping partitions: when a level's partitions are expected to be just under or just over
+  the frames, some split and some do not, which the formula's all-or-none levels cannot follow
+  (REPORT_M2 §7);
 - the sorted runs of a merge join being written once more;
 - materialised intermediate results.
 
@@ -178,6 +193,9 @@ from. Then:
   information to choose by keeps the order it was written in.
 - The rows of a subset are computed once, as the product of its leaves' rows and of every predicate
   inside it, so they do not depend on the order the subset was built in.
+- A block has at most 16 leaves, because a FROM clause may name at most 16 tables (GRAMMAR_SQL.md
+  section 5). The subsets are 32-bit sets, and when no predicate connects the leaves every subset is
+  built: 16 leaves take 0.8 seconds and 600 MB, and each one more doubles both.
 
 `opt dp-table` prints every candidate of every subset with its cost, and marks the winner with `*`.
 REPORT_M4.md has the full table for a four relation join.
@@ -207,6 +225,9 @@ them, while a left-deep tree has to bring C and D in one at a time onto A ⋈ B.
 The physical plan is the JSON Module 2 runs, with no editing (every plan in the tests is run). Each join
 carries its chosen algorithm, and distinct and group_by carry their mode. Each node also has `est_rows`
 and `est_cost`, which Module 2 ignores and the shell's EXPLAIN ANALYZE prints beside the actual counts.
+`opt explain` and the shell's EXPLAIN print a node a line in the module's format, indented two spaces
+per level, `hash_join (R.b = S.b) est_rows=2000 est_cost=330`, and then a last line with the plan's
+total, `total est_cost=...`.
 `opt plan --baseline` gives the unoptimised plan of REPORT_M4.md: nothing rewritten, joins in the order
 written, every join a nested loop, every group_by and distinct sort based.
 

@@ -23,6 +23,9 @@ struct Operator {
     std::vector<bool> materialize;
     Counters counters;
     std::string notes;
+    // frames this operator must leave free: one while its parent is yet to take the frame it writes this
+    // operator's output through, zero once it has
+    int parentFrames = 0;
 
     Operator(Database& d, std::string name) : db(d), op(std::move(name)) {}
     virtual ~Operator() = default;
@@ -38,6 +41,7 @@ struct Operator {
     virtual bool produce(Row& row) = 0;
     virtual void finish() {}
     virtual bool holdsMemory() const { return false; }
+    int available() const { return db.pool.freeFrames() - parentFrames; }
 };
 
 // frames taken from the pool as an operator's working memory
@@ -184,11 +188,18 @@ inline void openChild(Operator& op) { op.children[0]->open(); }
 
 // an input that holds memory is run to completion into a temporary file before its parent takes any
 // memory of its own, so no two operators ever hold working memory at the same time
+inline void parentFrameTaken(Operator& op) {
+    op.parentFrames = 0;
+    if (!op.holdsMemory()) for (auto& c : op.children) parentFrameTaken(*c);
+}
+// the child is opened before the output frame is taken, so whatever it materialises itself runs with that
+// frame still free, and only one output frame is ever held for any depth of materialisation
 inline Run materialized(Operator& op, size_t i, std::unique_ptr<SpillFile>& spill) {
     Operator& child = *op.children[i];
     if (!spill) spill = std::make_unique<SpillFile>(op.db);
-    RunWriter writer(op.db, spill->file, child.schema);
     child.open();
+    RunWriter writer(op.db, spill->file, child.schema);
+    parentFrameTaken(child);
     Row row;
     while (child.next(row)) writer.add(row);
     child.close();
@@ -228,6 +239,7 @@ struct ExternalSort {
     const std::vector<Col>& schema;
     std::vector<SortKey> keys;
     unsigned long long& comparisons;
+    int keep;
     std::unique_ptr<SpillFile> spill;
     std::vector<Run> runs;
     std::vector<Row> memory;
@@ -238,7 +250,8 @@ struct ExternalSort {
     std::vector<Row> heads;
     std::vector<bool> live;
 
-    ExternalSort(Database& d, const std::vector<Col>& s, std::vector<SortKey> k, unsigned long long& c) : db(d), schema(s), keys(std::move(k)), comparisons(c), frames(d.pool) {}
+    ExternalSort(Database& d, const std::vector<Col>& s, std::vector<SortKey> k, unsigned long long& c, int keepFree = 0)
+        : db(d), schema(s), keys(std::move(k)), comparisons(c), keep(keepFree), frames(d.pool) {}
     int cmp(const Row& a, const Row& b) { comparisons++; return compareKeys(a, b, keys); }
     uint32_t spillFile() { if (!spill) spill = std::make_unique<SpillFile>(db); return spill->file; }
     void sortMemory() { mergeSort(memory, [&](const Row& a, const Row& b) { return cmp(a, b) < 0; }); }
@@ -252,7 +265,7 @@ struct ExternalSort {
     // pass 0. A run is B pages: the frames reserved here and the frame the input page arrives in, the
     // textbook arrangement where the input pages are read into the sort's own buffers
     void generate(TupleSource& in) {
-        int work = db.pool.freeFrames() - in.framesToCome();
+        int work = db.pool.freeFrames() - keep - in.framesToCome();
         if (work < 1) throw Error{"error: sort needs at least 2 frames for its runs, " + std::to_string(work + in.framesToCome()) + " are free"};
         frames.take(work);
         passes = 1;
@@ -277,7 +290,7 @@ struct ExternalSort {
             frames.releaseAll();
             return;
         }
-        int fanIn = db.pool.freeFrames() - 1;
+        int fanIn = db.pool.freeFrames() - keep - 1;
         if (fanIn < 2) throw Error{"error: sort needs at least 3 frames to merge, " + std::to_string(fanIn + 1) + " are free"};
         while (runs.size() > (toOneRun ? 1 : size_t(fanIn))) {
             passes++;
@@ -431,7 +444,7 @@ struct Sort : Operator {
     bool holdsMemory() const override { return true; }
     void start() override {
         std::unique_ptr<TupleSource> in = inputOf(*this, 0, spill);
-        sorter = std::make_unique<ExternalSort>(db, schema, keys, counters.comparisons);
+        sorter = std::make_unique<ExternalSort>(db, schema, keys, counters.comparisons, parentFrames);
         sorter->generate(*in);
         in.reset();
         spill.reset();
@@ -480,7 +493,7 @@ struct SortDistinct : DistinctBase {
     SortDistinct(Database& d) : DistinctBase(d, false) {}
     void start() override {
         std::unique_ptr<TupleSource> in = inputOf(*this, 0, spill);
-        sorter = std::make_unique<ExternalSort>(db, schema, allColumns(schema.size()), counters.comparisons);
+        sorter = std::make_unique<ExternalSort>(db, schema, allColumns(schema.size()), counters.comparisons, parentFrames);
         sorter->generate(*in);
         in.reset();
         spill.reset();
@@ -516,7 +529,7 @@ struct SortGroupBy : Operator {
         if (keyColumns.empty()) { plain = std::move(in); havePending = plain->next(pending); return; }
         std::vector<SortKey> keys;
         for (size_t c : keyColumns) keys.push_back({c, false});
-        sorter = std::make_unique<ExternalSort>(db, children[0]->schema, keys, counters.comparisons);
+        sorter = std::make_unique<ExternalSort>(db, children[0]->schema, keys, counters.comparisons, parentFrames);
         sorter->generate(*in);
         in.reset();
         spill.reset();
@@ -636,7 +649,7 @@ struct HashDistinct : DistinctBase {
         std::vector<size_t> all;
         for (size_t i = 0; i < schema.size(); i++) all.push_back(i);
         grouping = std::make_unique<HashGrouping>(db, schema, all, none, counters.comparisons);
-        grouping->plan(db.pool.freeFrames() - in->framesToCome());
+        grouping->plan(available() - in->framesToCome());
         grouping->consume(*in, 0);
         in.reset();
         spill.reset();
@@ -663,7 +676,7 @@ struct HashGroupBy : Operator {
     void start() override {
         std::unique_ptr<TupleSource> in = inputOf(*this, 0, spill);
         grouping = std::make_unique<HashGrouping>(db, children[0]->schema, keyColumns, aggs, counters.comparisons);
-        grouping->plan(db.pool.freeFrames() - in->framesToCome());
+        grouping->plan(available() - in->framesToCome());
         grouping->consume(*in, 0);
         in.reset();
         spill.reset();
@@ -693,7 +706,8 @@ struct HashGroupBy : Operator {
 // each side that must be equal
 struct JoinCondition { std::unique_ptr<Node> cond; std::vector<size_t> left, right; };
 
-// block nested loop: fills a block of the outer, then streams the whole inner past it
+// block nested loop: fills a block of the outer, then streams the whole inner past it. The block takes
+// frames from the pool as it grows, up to blockPages of them
 struct BlockLoop {
     TupleSource& outer;
     TupleSource& inner;
@@ -701,18 +715,22 @@ struct BlockLoop {
     const Node* cond;
     unsigned long long& comparisons;
     int blockPages;
+    Frames& memory;
     std::vector<Row> block;
     Row pending, innerRow;
     bool havePending = false, outerDone = false, scanning = false;
     size_t at = 0;
     long long blocks = 0;
-    BlockLoop(TupleSource& o, TupleSource& i, const std::vector<Col>& s, const Node* c, unsigned long long& cmp, int pages)
-        : outer(o), inner(i), outerSchema(s), cond(c), comparisons(cmp), blockPages(pages) {}
+    BlockLoop(TupleSource& o, TupleSource& i, const std::vector<Col>& s, const Node* c, unsigned long long& cmp, int pages, Frames& f)
+        : outer(o), inner(i), outerSchema(s), cond(c), comparisons(cmp), blockPages(pages), memory(f) {
+        if (pages < 1) throw Error{"error: a block nested loop needs at least one frame for its block, none is free"};
+    }
     bool fill() {
         block.clear();
         Packing pack;
         if (!havePending && !outerDone) { havePending = outer.next(pending); outerDone = !havePending; }
         while (havePending && pack.add(encodedSize(outerSchema, pending), blockPages)) {
+            if (memory.count() < pack.pages) memory.take(1);
             block.push_back(std::move(pending));
             havePending = outer.next(pending);
             outerDone = !havePending;
@@ -751,14 +769,13 @@ struct NestedLoopJoin : Operator {
     void start() override {
         outer = inputOf(*this, 0, spill);
         inner = inputOf(*this, 1, spill);
-        int pages = db.pool.freeFrames() - outer->framesToCome() - inner->framesToCome();
-        if (pages < 1) throw Error{"error: nested_loop_join needs at least 3 frames, " + std::to_string(db.pool.freeFrames()) + " are free"};
-        block.take(pages);
-        loop = std::make_unique<BlockLoop>(*outer, *inner, children[0]->schema, join.cond.get(), counters.comparisons, pages);
+        int pages = available() - outer->framesToCome() - inner->framesToCome();
+        if (pages < 1) throw Error{"error: nested_loop_join needs at least 3 frames, " + std::to_string(available()) + " are free"};
+        loop = std::make_unique<BlockLoop>(*outer, *inner, children[0]->schema, join.cond.get(), counters.comparisons, pages, block);
     }
     bool produce(Row& row) override { return loop->next(row); }
     void finish() override {
-        notes = "block_pages=" + std::to_string(block.count()) + " blocks=" + std::to_string(loop ? loop->blocks : 0);
+        notes = "block_pages=" + std::to_string(loop ? loop->blockPages : 0) + " blocks=" + std::to_string(loop ? loop->blocks : 0);
         loop.reset(); outer.reset(); inner.reset(); block.releaseAll(); spill.reset();
     }
 };
@@ -797,8 +814,8 @@ struct HashJoin : Operator {
     }
     void start() override {
         spill = std::make_unique<SpillFile>(db);
-        int count = db.pool.freeFrames() - 1;
-        if (count < 1) throw Error{"error: hash_join needs at least 2 frames, " + std::to_string(db.pool.freeFrames()) + " are free"};
+        int count = available() - 1;
+        if (count < 1) throw Error{"error: hash_join needs at least 2 frames, " + std::to_string(available()) + " are free"};
         leftParts = partition(0, join.left, count);
         rightParts = partition(1, join.right, count);
         std::string sizes;
@@ -813,14 +830,12 @@ struct HashJoin : Operator {
         for (; part < leftParts.size(); part++) {
             const Run& r = leftParts[part];
             if (r.tuples == 0 || rightParts[part].tuples == 0) continue;
-            int room = db.pool.freeFrames() - 1;
+            int room = available() - 1;
             if (int(r.pages.size()) > room) {
                 overflowed++;
                 fallbackOuter = std::make_unique<RunSource>(db, r, children[0]->schema);
                 fallbackInner = std::make_unique<RunSource>(db, rightParts[part], children[1]->schema);
-                int pages = db.pool.freeFrames();
-                tableFrames.take(pages);
-                fallback = std::make_unique<BlockLoop>(*fallbackOuter, *fallbackInner, children[0]->schema, join.cond.get(), counters.comparisons, pages);
+                fallback = std::make_unique<BlockLoop>(*fallbackOuter, *fallbackInner, children[0]->schema, join.cond.get(), counters.comparisons, available(), tableFrames);
                 return;
             }
             tableFrames.take(int(r.pages.size()));
@@ -891,7 +906,7 @@ struct SortMergeJoin : Operator {
         std::unique_ptr<TupleSource> in = inputOf(*this, side, spill);
         std::vector<SortKey> sortKeys;
         for (size_t k : keys) sortKeys.push_back({k, false});
-        sorter = std::make_unique<ExternalSort>(db, children[side]->schema, sortKeys, counters.comparisons);
+        sorter = std::make_unique<ExternalSort>(db, children[side]->schema, sortKeys, counters.comparisons, parentFrames);
         sorter->generate(*in);
         in.reset();
         return sorter->single();
@@ -957,7 +972,7 @@ struct SortUnion : Operator {
     void start() override {
         std::unique_ptr<Run> right;
         if (materialize[1]) right = std::make_unique<Run>(materialized(*this, 1, spill));
-        sorter = std::make_unique<ExternalSort>(db, schema, allColumns(schema.size()), counters.comparisons);
+        sorter = std::make_unique<ExternalSort>(db, schema, allColumns(schema.size()), counters.comparisons, parentFrames);
         {
             Both in(*this, std::move(right));
             sorter->generate(in);
@@ -992,7 +1007,7 @@ struct SetDifference : Operator {
     bool holdsMemory() const override { return true; }
     Run sortSide(size_t side, std::unique_ptr<ExternalSort>& sorter) {
         std::unique_ptr<TupleSource> in = inputOf(*this, side, spill);
-        sorter = std::make_unique<ExternalSort>(db, children[side]->schema, allColumns(schema.size()), counters.comparisons);
+        sorter = std::make_unique<ExternalSort>(db, children[side]->schema, allColumns(schema.size()), counters.comparisons, parentFrames);
         sorter->generate(*in);
         in.reset();
         return sorter->single();

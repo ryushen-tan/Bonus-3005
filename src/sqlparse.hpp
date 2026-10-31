@@ -10,7 +10,7 @@
 struct SqlError { std::string category, message; int line, col; };
 inline std::string sqlErrorText(const SqlError& e) { return "error: " + e.category + ": " + e.message + " at line " + std::to_string(e.line) + ", column " + std::to_string(e.col); }
 
-enum SqlTok { Keyword, Identifier, Integer, String, Operator, Punct, EndOfInput };
+enum SqlTok { KeywordToken, IdentifierToken, IntegerToken, StringToken, OperatorToken, PunctToken, EndToken };
 struct SqlToken { SqlTok kind; std::string text; int line, col; };
 
 const std::set<std::string> KEYWORDS = {"SELECT", "DISTINCT", "FROM", "WHERE", "GROUP", "BY", "HAVING", "ORDER", "ASC", "DESC", "LIMIT", "UNION", "ALL",
@@ -35,34 +35,34 @@ inline std::vector<SqlToken> sqlTokens(const std::string& s) {
             size_t j = i;
             while (j < s.size() && wordChar(s[j])) j++;
             std::string word = s.substr(i, j - i);
-            if (KEYWORDS.count(upper(word))) emit(Keyword, upper(word)); else emit(Identifier, word);
+            if (KEYWORDS.count(upper(word))) emit(KeywordToken, upper(word)); else emit(IdentifierToken, word);
             i = j;
         }
         else if (dig(c) || (c == '-' && i + 1 < s.size() && dig(s[i + 1]))) {
             size_t j = i + 1;
             while (j < s.size() && dig(s[j])) j++;
             if (j < s.size() && wordChar(s[j])) throw SqlError{"lexical", "a number cannot run into a name: '" + s.substr(i, j - i + 1) + "'", line, col};
-            emit(Integer, s.substr(i, j - i));
+            emit(IntegerToken, s.substr(i, j - i));
             i = j;
         }
         else if (c == '\'') {
-            try { emit(String, scanString(s, i, line, col)); } catch (const Error&) { throw SqlError{"lexical", "unterminated string", line, col}; }
+            try { emit(StringToken, scanString(s, i, line, col)); } catch (const Error&) { throw SqlError{"lexical", "unterminated string", line, col}; }
         }
         else if (c == '<' || c == '>' || c == '!' || c == '=') {
             size_t len = i + 1 < s.size() && (s[i + 1] == '=' || (c == '<' && s[i + 1] == '>')) && c != '=' ? 2 : 1;
             std::string op = s.substr(i, len);
             if (op == "!") throw SqlError{"lexical", "unexpected character '!'", line, col};
-            emit(Operator, op == "!=" ? "<>" : op);
+            emit(OperatorToken, op == "!=" ? "<>" : op);
             i += len;
         }
-        else if (std::string("(),.;*").find(c) != std::string::npos) { emit(Punct, std::string(1, c)); i++; }
+        else if (std::string("(),.;*").find(c) != std::string::npos) { emit(PunctToken, std::string(1, c)); i++; }
         else {
             size_t j = i + 1;
             while (j < s.size() && ((unsigned char)s[j] & 0xC0) == 0x80) j++;
             throw SqlError{"lexical", "unexpected character '" + s.substr(i, j - i) + "'", line, col};
         }
     }
-    out.push_back({EndOfInput, "end of input", line, int(s.size() - start) + 1});
+    out.push_back({EndToken, "end of input", line, int(s.size() - start) + 1});
     return out;
 }
 
@@ -121,27 +121,27 @@ struct SqlParser {
     int depth = 0;
     const SqlToken& cur() const { return toks[p]; }
     SqlToken take() { return toks[p++]; }
-    bool at(const std::string& text) const { return (cur().kind == Keyword || cur().kind == Punct || cur().kind == Operator) && cur().text == text; }
+    bool at(const std::string& text) const { return (cur().kind == KeywordToken || cur().kind == PunctToken || cur().kind == OperatorToken) && cur().text == text; }
     bool accept(const std::string& text) { if (!at(text)) return false; p++; return true; }
     static std::string shown(const SqlToken& t) {
         switch (t.kind) {
-            case EndOfInput: return t.text;
-            case String: return "string " + quoted(t.text);
-            case Keyword: return "keyword " + t.text;
+            case EndToken: return t.text;
+            case StringToken: return "string " + quoted(t.text);
+            case KeywordToken: return "keyword " + t.text;
             default: return "'" + t.text + "'";
         }
     }
     [[noreturn]] void fail(const std::string& what) { throw SqlError{"syntax", "expected " + what + " but found " + shown(cur()), cur().line, cur().col}; }
     SqlToken expect(const std::string& text) { if (!at(text)) fail(text.size() == 1 ? "'" + text + "'" : text); return take(); }
-    SqlToken ident(const std::string& what) { if (cur().kind != Identifier) fail(what); return take(); }
+    SqlToken ident(const std::string& what) { if (cur().kind != IdentifierToken) fail(what); return take(); }
     void enter() { if (++depth > 200) throw SqlError{"syntax", "nesting too deep", cur().line, cur().col}; }
 
     std::vector<Statement> script() {
         std::vector<Statement> out;
-        while (cur().kind != EndOfInput) {
+        while (cur().kind != EndToken) {
             if (accept(";")) continue;
             out.push_back(statement());
-            if (cur().kind != EndOfInput) expect(";");
+            if (cur().kind != EndToken) expect(";");
         }
         return out;
     }
@@ -162,7 +162,7 @@ struct SqlParser {
             expect("VALUES");
             expect("(");
             do {
-                if (cur().kind != Integer && cur().kind != String) fail("a number or a string");
+                if (cur().kind != IntegerToken && cur().kind != StringToken) fail("a number or a string");
                 s.values.push_back(operand());
             } while (accept(","));
             expect(")");
@@ -179,7 +179,7 @@ struct SqlParser {
         if (accept("INT")) return c;
         expect("VARCHAR");
         expect("(");
-        if (cur().kind != Integer) fail("a length");
+        if (cur().kind != IntegerToken) fail("a length");
         SqlToken n = take();
         if (n.text.size() > 4 || n.text[0] == '-' || std::stoi(n.text) < 1 || std::stoi(n.text) > 255) throw SqlError{"schema", "VARCHAR length must be 1 to 255, not " + n.text, n.line, n.col};
         c.varchar = true;
@@ -212,7 +212,7 @@ struct SqlParser {
             } while (accept(","));
         }
         if (accept("LIMIT")) {
-            if (cur().kind != Integer || cur().text[0] == '-' || cur().text.size() > 18) fail("a non-negative number of rows");
+            if (cur().kind != IntegerToken || cur().text[0] == '-' || cur().text.size() > 18) fail("a non-negative number of rows");
             q->limit = std::stoll(take().text);
         }
         return q;
@@ -247,7 +247,7 @@ struct SqlParser {
         item.line = cur().line; item.col = cur().col;
         if (aggregateStart()) { item.isAgg = true; item.agg = aggregate(); } else item.column = column();
         if (accept("AS")) item.alias = ident("an alias").text;
-        else if (cur().kind == Identifier) item.alias = take().text;
+        else if (cur().kind == IdentifierToken) item.alias = take().text;
         return item;
     }
     AggCall aggregate() {
@@ -292,7 +292,7 @@ struct SqlParser {
         }
         r.table = ident("a table name").text;
         if (accept("AS")) r.alias = ident("an alias").text;
-        else if (cur().kind == Identifier) r.alias = take().text;
+        else if (cur().kind == IdentifierToken) r.alias = take().text;
         return r;
     }
     // NOT binds tighter than AND, AND tighter than OR, both left associative
@@ -331,7 +331,7 @@ struct SqlParser {
         }
         if (accept("(")) { enter(); Condition c = condition(); expect(")"); depth--; return c; }
         Condition c{Condition::Compare, "", {}, operand(), {}, 0, 0};
-        if (cur().kind != Operator) fail("a comparison operator");
+        if (cur().kind != OperatorToken) fail("a comparison operator");
         SqlToken op = take();
         c.op = op.text; c.line = op.line; c.col = op.col;
         c.right = operand();
@@ -340,10 +340,10 @@ struct SqlParser {
     SqlOperand operand() {
         SqlOperand o;
         o.line = cur().line; o.col = cur().col;
-        if (cur().kind == Integer) { o.kind = SqlOperand::Int; o.literal = take().text; }
-        else if (cur().kind == String) { o.kind = SqlOperand::Str; o.literal = take().text; }
+        if (cur().kind == IntegerToken) { o.kind = SqlOperand::Int; o.literal = take().text; }
+        else if (cur().kind == StringToken) { o.kind = SqlOperand::Str; o.literal = take().text; }
         else if (aggregateStart()) { o.kind = SqlOperand::Agg; o.agg = aggregate(); }
-        else if (cur().kind == Identifier) { o.kind = SqlOperand::Column; o.column = column(); }
+        else if (cur().kind == IdentifierToken) { o.kind = SqlOperand::Column; o.column = column(); }
         else fail("a column, a number or a string");
         return o;
     }

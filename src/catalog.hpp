@@ -2,11 +2,13 @@
 #pragma once
 #include "heap.hpp"
 #include <cctype>
+#include <deque>
 #include <filesystem>
 #include <sstream>
 
 struct Bucket { Value lo, hi; long long count, ndv; };
-struct ColumnStats { long long ndv = 0; Value min, max; std::vector<Bucket> histogram; };
+// width is the column's average encoded size in bytes
+struct ColumnStats { long long ndv = 0; Value min, max; std::vector<Bucket> histogram; double width = 0; };
 struct TableStats { bool analyzed = false; long long tuples = 0, pages = 0; double width = 0; std::vector<ColumnStats> columns; };
 struct Table {
     std::string name, fileName;
@@ -26,7 +28,7 @@ inline std::vector<Col> recordSchema(int kind) {
         case TableRecord: return {i("kind"), s("table"), s("file"), i("data_pages"), i("live_tuples")};
         case ColumnRecord: return {i("kind"), s("table"), i("position"), s("name"), i("type"), i("length")};
         case TableStatsRecord: return {i("kind"), s("table"), i("tuples"), i("pages"), s("width")};
-        case ColumnStatsRecord: return {i("kind"), s("table"), i("position"), i("ndv"), s("min"), s("max")};
+        case ColumnStatsRecord: return {i("kind"), s("table"), i("position"), i("ndv"), s("min"), s("max"), s("width")};
         default: return {i("kind"), s("table"), i("position"), i("index"), s("lo"), s("hi"), i("count"), i("ndv")};
     }
 }
@@ -37,7 +39,8 @@ struct Database {
     std::string dir;
     DiskManager disk;
     BufferPool pool;
-    std::vector<Table> tables;
+    // a deque, so that creating a table never moves the others a caller may be holding
+    std::deque<Table> tables;
     uint32_t catalogFile;
 
     Database(const std::string& directory, int frames, Policy policy = Lru) : dir(directory), pool(disk, frames, policy) {
@@ -50,32 +53,49 @@ struct Database {
     }
     Database(const Database&) = delete;
 
+    // first fit may put a later record on an earlier page, so the records are read in full and then applied
+    // tables first, every column and bucket at the position it records
     void readCatalog() {
-        HeapScan scan(pool, catalogFile);
-        Rid rid;
-        std::string_view record;
-        while (scan.next(rid, record)) {
-            int kind = int32_t(get32((const uint8_t*)record.data()));
-            Row r = decode(recordSchema(kind), record);
-            if (kind == TableRecord) {
-                Table t{r[1].text, r[2].text, {}, uint32_t(r[3].num), uint32_t(r[4].num), {}, 0};
-                t.file = disk.open(dir + "/" + t.fileName);
-                tables.push_back(t);
-                continue;
+        std::vector<Row> records[6];
+        {
+            HeapScan scan(pool, catalogFile);
+            Rid rid;
+            std::string_view record;
+            while (scan.next(rid, record)) {
+                int kind = int32_t(get32((const uint8_t*)record.data()));
+                records[kind].push_back(decode(recordSchema(kind), record));
             }
+        }
+        for (const Row& r : records[TableRecord]) {
+            Table t{r[1].text, r[2].text, {}, uint32_t(r[3].num), uint32_t(r[4].num), {}, 0};
+            t.file = disk.open(dir + "/" + t.fileName);
+            tables.push_back(t);
+        }
+        for (const Row& r : records[ColumnRecord]) {
             Table& t = table(r[1].text);
-            if (kind == ColumnRecord) { t.cols.push_back({t.name, r[3].text, r[4].num == 0 ? IntT : StrT, int(r[5].num)}); t.stats.columns.emplace_back(); }
-            else if (kind == TableStatsRecord) { t.stats.analyzed = true; t.stats.tuples = (long long)r[2].num; t.stats.pages = (long long)r[3].num; t.stats.width = std::stod(r[4].text); }
-            else if (kind == ColumnStatsRecord) {
-                const Col& c = t.cols[size_t(r[2].num)];
-                ColumnStats& s = t.stats.columns[size_t(r[2].num)];
-                s.ndv = (long long)r[3].num;
-                if (s.ndv > 0) { s.min = parsedValue(c, r[4].text); s.max = parsedValue(c, r[5].text); }
-            }
-            else {
-                const Col& c = t.cols[size_t(r[2].num)];
-                t.stats.columns[size_t(r[2].num)].histogram.push_back({parsedValue(c, r[4].text), parsedValue(c, r[5].text), (long long)r[6].num, (long long)r[7].num});
-            }
+            size_t at = size_t(r[2].num);
+            if (t.cols.size() <= at) { t.cols.resize(at + 1); t.stats.columns.resize(at + 1); }
+            t.cols[at] = {t.name, r[3].text, r[4].num == 0 ? IntT : StrT, int(r[5].num)};
+        }
+        for (const Row& r : records[TableStatsRecord]) {
+            TableStats& s = table(r[1].text).stats;
+            s.analyzed = true; s.tuples = (long long)r[2].num; s.pages = (long long)r[3].num; s.width = std::stod(r[4].text);
+        }
+        for (const Row& r : records[ColumnStatsRecord]) {
+            Table& t = table(r[1].text);
+            const Col& c = t.cols[size_t(r[2].num)];
+            ColumnStats& s = t.stats.columns[size_t(r[2].num)];
+            s.ndv = (long long)r[3].num;
+            s.width = std::stod(r[6].text);
+            if (s.ndv > 0) { s.min = parsedValue(c, r[4].text); s.max = parsedValue(c, r[5].text); }
+        }
+        for (const Row& r : records[BucketRecord]) {
+            Table& t = table(r[1].text);
+            const Col& c = t.cols[size_t(r[2].num)];
+            std::vector<Bucket>& h = t.stats.columns[size_t(r[2].num)].histogram;
+            size_t at = size_t(r[3].num);
+            if (h.size() <= at) h.resize(at + 1);
+            h[at] = {parsedValue(c, r[4].text), parsedValue(c, r[5].text), (long long)r[6].num, (long long)r[7].num};
         }
     }
     // the whole catalog is small, so a change rewrites catalog.db from the first page
@@ -95,12 +115,11 @@ struct Database {
             for (size_t i = 0; i < t.cols.size(); i++)
                 put(ColumnRecord, {textValue(t.name), num(long(i)), textValue(t.cols[i].name), num(t.cols[i].type == StrT), num(t.cols[i].length)});
             if (!t.stats.analyzed) continue;
-            char width[32];
-            std::snprintf(width, sizeof width, "%.17g", t.stats.width);
-            put(TableStatsRecord, {textValue(t.name), num(t.stats.tuples), num(t.stats.pages), textValue(width)});
+            auto exact = [](double d) { char text[32]; std::snprintf(text, sizeof text, "%.17g", d); return textValue(text); };
+            put(TableStatsRecord, {textValue(t.name), num(t.stats.tuples), num(t.stats.pages), exact(t.stats.width)});
             for (size_t i = 0; i < t.cols.size(); i++) {
                 const ColumnStats& s = t.stats.columns[i];
-                put(ColumnStatsRecord, {textValue(t.name), num(long(i)), num(s.ndv), textValue(s.ndv ? s.min.text : ""), textValue(s.ndv ? s.max.text : "")});
+                put(ColumnStatsRecord, {textValue(t.name), num(long(i)), num(s.ndv), textValue(s.ndv ? s.min.text : ""), textValue(s.ndv ? s.max.text : ""), exact(s.width)});
                 for (size_t b = 0; b < s.histogram.size(); b++)
                     put(BucketRecord, {textValue(t.name), num(long(i)), num(long(b)), textValue(s.histogram[b].lo.text), textValue(s.histogram[b].hi.text), num(s.histogram[b].count), num(s.histogram[b].ndv)});
             }

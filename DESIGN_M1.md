@@ -157,7 +157,7 @@ every record is its kind:
 | 1 table | kind INT, table VARCHAR(255), file VARCHAR(255), data_pages INT, live_tuples INT |
 | 2 column | kind INT, table, position INT, name VARCHAR(255), type INT (0 INT, 1 VARCHAR), length INT |
 | 3 table statistics | kind INT, table, tuples INT, pages INT, width VARCHAR(255) (a double written with 17 digits) |
-| 4 column statistics | kind INT, table, position INT, ndv INT, min VARCHAR(255), max VARCHAR(255) |
+| 4 column statistics | kind INT, table, position INT, ndv INT, min VARCHAR(255), max VARCHAR(255), width VARCHAR(255) (average bytes) |
 | 5 histogram bucket | kind INT, table, position INT, index INT, lo, hi VARCHAR(255), count INT, ndv INT |
 
 Kinds 3 to 5 are the room the module document asks to leave for Module 4. Values of either type are

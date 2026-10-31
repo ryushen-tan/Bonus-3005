@@ -79,6 +79,12 @@ inline void equalityKeys(const Node& c, size_t leftWidth, JoinCondition& join) {
     join.right.push_back(r - leftWidth);
 }
 
+// the operators that will hold memory while a parent writes this input to a temporary file must leave the
+// parent's output frame free; pipelined operators pass that on to their inputs
+inline void leaveFrameForParent(Operator& op) {
+    if (op.holdsMemory()) { op.parentFrames = 1; return; }
+    for (auto& c : op.children) leaveFrameForParent(*c);
+}
 inline bool holdsMemoryBelow(const Operator& op) {
     if (op.holdsMemory()) return true;
     for (const auto& c : op.children) if (holdsMemoryBelow(*c)) return true;
@@ -196,7 +202,8 @@ inline std::unique_ptr<Operator> buildNode(Database& db, const Json& j, const st
     node->children = std::move(kids);
     node->materialize.assign(node->children.size(), false);
     if (node->holdsMemory())
-        for (size_t i = 0; i < node->children.size(); i++) node->materialize[i] = holdsMemoryBelow(*node->children[i]);
+        for (size_t i = 0; i < node->children.size(); i++)
+            if ((node->materialize[i] = holdsMemoryBelow(*node->children[i]))) leaveFrameForParent(*node->children[i]);
     return node;
 }
 inline std::unique_ptr<Operator> buildPlan(Database& db, const Json& plan) {
@@ -260,10 +267,9 @@ inline int execTool(const std::vector<std::string>& args, std::ostream& out) {
         int frames = a.number("frames", 32);
         if (frames < 1) throw Error{"error: --frames must be at least 1"};
         Json plan = parseJson(readFile(a.need("plan")));
-        if (!std::filesystem::exists(a.need("db") + "/catalog.db")) throw Error{"error: " + a.need("db") + " is not a database, it has no catalog.db"};
-        Database db(a.need("db"), frames, policyNamed(a.get("policy", "lru")));
-        std::unique_ptr<Operator> root = buildPlan(db, plan);
-        Result r = execute(db, *root);
+        std::unique_ptr<Database> db = openDatabase(a.need("db"), frames, policyNamed(a.get("policy", "lru")));
+        std::unique_ptr<Operator> root = buildPlan(*db, plan);
+        Result r = execute(*db, *root);
         if (a.command == "trace") {
             printTrace(*root, out);
             Counters t = totals(*root);

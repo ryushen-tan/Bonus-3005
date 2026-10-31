@@ -9,10 +9,6 @@ inline SqlCompiler compilerFor(Database& db) {
     c.tables = [&db](const std::string& name) -> const std::vector<Col>* { Table* t = db.find(name); return t ? &t->cols : nullptr; };
     return c;
 }
-inline std::unique_ptr<Database> openDatabase(const std::string& dir, int frames) {
-    if (!std::filesystem::exists(dir + "/catalog.db")) throw Error{"error: " + dir + " is not a database, it has no catalog.db"};
-    return std::make_unique<Database>(dir, frames);
-}
 
 inline int sqlTool(const std::vector<std::string>& args, std::ostream& out) {
     const char* usage = "usage: sql parse   --query \"SELECT ...\" [--explain]\n"

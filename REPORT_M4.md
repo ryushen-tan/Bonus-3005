@@ -223,9 +223,11 @@ would do:
   which records that level is determined by salary for almost all rows, so the optimiser can use
   sel(salary > 160000) alone for the conjunction.
 
-The third is the cheapest to keep and is exactly what this case needs. Without a joint statistic, a
-cheaper fix is to assume less independence, as PostgreSQL's planner does not, but some systems do. For
-example, use the minimum of the two selectivities when two predicates are on columns of the same table.
+The third is the cheapest to keep and is exactly what this case needs. Without any joint statistic, a
+cheaper hedge is to assume less independence between predicates on the same table. SQL Server's newer
+cardinality estimator, for example, combines conjunctive predicates with exponential backoff (the most
+selective in full, the next by its square root, and so on) instead of a plain product. That would have
+estimated 20000 · 0.113 · √0.123 = 790 rows here: still low, but within a factor of 3.1 instead of 8.7.
 
 ## 5 The DP table of a four relation join
 

@@ -194,3 +194,126 @@ the SQL front end and the optimizer can all reach into this code.
    `D1, D2` under sets and now returns `D1, D1, D2`. The old answer is `distinct(project[DID](Employees))`,
    added as 23b. Among the extras, x29 (duplicates in a file were collapsed, now kept), x39, x40 and x48
    (projections after a join now show every matching pair) changed for the same reason. 122 of 122 pass.
+
+## 2026-10-30, session 9: Module 1, storage engine and buffer pool
+
+Goal: the five `storage` commands, with the two worked examples reproducing exactly. Wrote the byte
+layouts first (`page.hpp`) as functions over a page's bytes, so the 3.2 example could be checked on a page
+in memory before any file existed. Then the buffer pool with LRU as access stamps, and CLOCK as the module's
+pseudocode line for line, then the heap file with first fit over the directory.
+
+Decisions made while writing it:
+- **The scan copies a directory page's list of data page ids and unpins it**, so it holds one frame, not
+  two. Otherwise a hash join could not have B − 1 partitions plus its input at B = 4 (DESIGN_M1.md 4).
+- **The catalog is itself a heap file of typed records**, rewritten whole on every change.
+- **Operator memory will be frames reserved from the pool** (`reserve`/`release`), decided now so
+  Module 2 cannot hold memory beside the pool.
+- **Every command empties the pool after reading the catalog**, so its counters start from zero (`clear`).
+
+What broke: nothing in the engine. Both worked examples and the checklist passed on the first build
+(22 of 22). One test of my own was wrong: I meant to load a record longer than 4088 bytes but built one of
+15 × 257 + 202 = 4057 bytes, which fits; rewrote it with sixteen 255 byte fields (4112 bytes). Measuring:
+trace 3 floods both policies, zero hits at B = 64, which is the point of REPORT_M1.md.
+
+## 2026-10-30, session 10: Module 2, the execution engine
+
+Goal: every operator, the external sort's worked example, and every plan running at B = 4. Wrote the
+iterator base with the `Charge` wrapper that points the disk manager's counters at the running operator,
+then runs and readers for temporary files, then the external sort, then the operators. The test oracle is
+the Bonus 1 engine: each physical plan is mapped back to a relational algebra tree and the two bags must
+agree.
+
+What broke, in order:
+
+1. **It did not compile.** The operator structs `Project`, `Rename`, `Distinct` and `Union` had the same
+   names as enumerators of the algebra's `Kind`, which win in an unscoped enum. Renamed the structs.
+2. **The three joins agreed on the row count but not on the rows.** Hashing each output showed the hash
+   join's was different. Its probe phase read the right input's partitions with a reader built for the
+   left input's schema, so `S.c`, a VARCHAR, was decoded as an INT. The fix is a reader per side.
+3. **The sort-merge join read 84 pages to join 9.** Every rewind to the start of a group of equal keys
+   on the right re-read the page it had just left. Gave the right reader a second frame that keeps the
+   previous page, which is the "3 for the merge" of the module. 14 reads.
+4. **The test binary crashed with a segmentation fault and no output.** AddressSanitizer showed a use
+   after free in `BufferPool::release`: my test harness kept the operator tree alive after the Database
+   that owns the pool. Test bug; the Database now lives in the same struct, declared first.
+5. **`union` over two memory-holding inputs failed at every B** with "hash grouping needs at least 3
+   frames, 0 are free". It materialised its right input only when it reached it, by which time its own
+   sort had taken every frame. Materialise every such input before taking memory.
+6. **A four-table plan from the optimizer failed at B = 4** with "nested_loop_join needs at least 3
+   frames, 2 are free". Nested materialisation held one output frame per level. The fix: the child is
+   opened before its parent takes the output frame, and the memory-holding operators below are told to
+   leave one frame free.
+7. **That fix then lost rows.** After the output frame was taken, operators that sized their memory
+   later still left a frame free for it, so it was counted twice. At B = 4 a hash join's overflow fallback
+   got a block of 0 frames, and a block nested loop with no block quietly produces nothing. The oracle
+   test caught it (399869 rows against 600610). Now the reservation is cleared once the frame is taken,
+   and a block nested loop with no frames is an error rather than an empty result.
+
+Also changed: the nested loop's block takes frames as it fills rather than all at once, so `peak_frames`
+reports what was used. The sort's in-memory runs use my own merge sort, so comparison counts do not
+depend on the standard library. After these, 19 of 19 suites pass under AddressSanitizer and
+UndefinedBehaviorSanitizer.
+
+## 2026-10-30, session 11: Module 3, the SQL front end
+
+Goal: the seven translation examples and the fifteen cases. Grammar first (GRAMMAR_SQL.md), then the
+scanner and parser, then scopes and translation. The decisions where the module's sketch and PostgreSQL
+differ (ORDER BY and LIMIT after a set operation, optional AS, `!=`) went to PostgreSQL, because the
+integration workload is checked against it; each is listed in GRAMMAR_SQL.md section 4.
+
+The seven examples printed the right shapes on the first compile. The test suite ran 47 of 50 the first
+time, and all three failures were my expected strings, not the compiler. I had counted the type error's
+column as the `age` token rather than the `>` operator. A column alias after the first projection is
+named by the alias. And a string position was off by one.
+
+What broke later: once the optimizer included both the SQL headers and the executor's, the SQL token
+kind `Operator` (an unscoped enumerator) hid the executor's `Operator` class. Renamed the token kinds
+with a `Token` suffix.
+
+## 2026-10-30, session 12: Module 4, the optimizer
+
+Goal: ANALYZE, the selectivity example, the rewrite example and the DP example reproducing, and every
+physical plan running in Module 2. What broke:
+
+1. **The first `opt explain` crashed.** `prune(std::move(n), outputCols(n))` is unspecified about which
+   argument is evaluated first, and here the move happened first. Compute the columns, then move.
+2. **The fix did not seem to work**, because the Makefile had no `opt` target and `make opt` silently
+   built nothing. Added the target; the fix had worked.
+3. **The rewrite example came out with the selects below the renames.** Rule 4 moved them, which is
+   valid but gains nothing over a scan and is not what the module's example shows. Refined its
+   precondition: not below a rename sitting directly on a scan. The DP also broke a cost tie by putting
+   Dept first; ties now keep the written order.
+4. **The DP considered {A,C}**, which the module's table skips. Added the connected-subset rule: no
+   cross products while a plan without them exists. The table then reproduced (110, 410, skipped, 530).
+   The alternative row is 650, not the module's 550: the module counts 1 block where 40 pages over 30
+   frames are 2 (DESIGN_M4.md section 5).
+5. **"unknown table Ten" on reopening a database.** Once statistics made `catalog.db` span pages, first
+   fit put a later table's column record on an earlier page than its table record, and reading assumed
+   file order. Now all records are read, then applied in order: tables, columns by position, statistics.
+6. **AddressSanitizer: a use after free of a `Table`.** `Database::tables` was a vector, so creating a
+   table could move the others while something held a reference. It is a deque now.
+7. **The optimizer tests hung.** The unoptimised plan of a four-way comma join is a cross product of 43
+   billion rows. The comparison uses the query's JOIN ON twin instead.
+8. **Measurement problems.**
+   - Turning rule 1 off changed nothing, because the join enumeration split conjunctions by itself. With
+     rule 1 off it now keeps conditions whole.
+   - The q-error of nodes under a LIMIT was meaningless (a sort that handed over 5 of its 2000 rows), so
+     they are left out of the statistics.
+   - UNION was estimated at l + r, ignoring that it removes duplicates (632 estimated, 5 actual). It is
+     capped by the columns' distinct values now.
+9. **The correlated-columns experiment did not show a bad plan at first.** On the scale 5 data the
+   misestimated plan was cheaper by luck at B = 4. A bad plan needs the underestimated side to be the
+   outer of a nested loop against a large inner, so I used the scale 20 data with the wide Emp columns.
+   Result: 2.10 times the I/O of the plan chosen with the right estimate at B = 4 (REPORT_M4.md section 4).
+
+## 2026-10-30, session 13: integration and end to end checking
+
+Goal: one `db` binary, and evidence that the whole system gives the right answers. The shell is wiring
+only: it calls the same functions the four tools call. Set up a private PostgreSQL 17 cluster with C
+collation, so string order is bytewise like mine, and wrote `tests/e2e/run.py`. It runs 44 queries
+through `sql compile`, `opt plan` and `exec run` as separate processes, at B = 4, 8 and 32, optimised
+and unoptimised, and compares each result with PostgreSQL's.
+
+The first run agreed on 252 of 258. All six disagreements were one query whose AVG I compared by rounding
+both sides to three decimals. My AVG is already rounded to four, so a value near a boundary rounds
+differently from PostgreSQL's exact numeric. Comparing numbers within 0.0001 instead: 258 of 258.

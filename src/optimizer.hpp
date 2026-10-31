@@ -367,8 +367,13 @@ struct Optimizer {
         else {
             out = in[0];
             const LogicalNode &l = n.kids[0], &r = n.kids[1];
-            if (n.op == "union_all" || n.op == "union") rows = l.rows + r.rows;
-            else if (n.op == "intersect") rows = std::min(l.rows, r.rows);
+            // the set operations that remove duplicates can return no more rows than there are distinct combinations
+            double either = 1, both = 1, left = 1;
+            for (size_t i = 0; i < out.size(); i++) { either *= in[0][i].ndv + in[1][i].ndv; both *= std::min(in[0][i].ndv, in[1][i].ndv); left *= in[0][i].ndv; }
+            if (n.op == "union_all") rows = l.rows + r.rows;
+            else if (n.op == "union") rows = std::min(l.rows + r.rows, either);
+            else if (n.op == "intersect") rows = std::min({l.rows, r.rows, both});
+            else rows = std::min(l.rows, left);
             if (n.op == "union") { double p = l.pages + r.pages; n.cost = read(l) + read(r) + 2 * p * (passes(p) - 1); }
             else if (n.op != "union_all") n.cost = sortCost(l) + sortCost(r) + l.pages + r.pages;
         }
@@ -387,8 +392,9 @@ struct Optimizer {
     // the leaves of a block of joins and the predicates over them; a predicate from a select (not from a
     // join's own condition) is marked, because with rule 3 off it may not become a join condition
     void collect(LogicalNode& n, std::vector<Leaf>& leaves, std::vector<std::pair<std::string, bool>>& preds) {
+        auto parts = [&](const std::string& cond) { return on(1) ? conjuncts(parseCondition(cond)) : std::vector<Node>{parseCondition(cond)}; };
         if (n.op == "join" || n.op == "cross") {
-            if (n.op == "join") for (const Node& c : conjuncts(parseCondition(n.condition))) preds.emplace_back(condText(c), false);
+            if (n.op == "join") for (const Node& c : parts(n.condition)) preds.emplace_back(condText(c), false);
             collect(n.kids[0], leaves, preds);
             collect(n.kids[1], leaves, preds);
             return;
@@ -397,7 +403,7 @@ struct Optimizer {
             LogicalNode* below = &n.kids[0];
             while (below->op == "select") below = &below->kids[0];
             if (below->op == "join" || below->op == "cross") {
-                for (const Node& c : conjuncts(parseCondition(n.condition))) preds.emplace_back(condText(c), true);
+                for (const Node& c : parts(n.condition)) preds.emplace_back(condText(c), true);
                 collect(n.kids[0], leaves, preds);
                 return;
             }

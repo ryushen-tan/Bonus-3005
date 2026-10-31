@@ -1,6 +1,6 @@
 CXX = clang++
 CXXFLAGS = -std=c++17 -O2 -Wall -Wextra -Werror
-TOOLS = ra gen storage exec sql opt
+TOOLS = ra gen storage exec sql opt db
 TESTS = ratest storagetest exectest sqltest opttest
 
 all: $(TOOLS)
@@ -36,6 +36,9 @@ opt: src/opt.cpp src/*.hpp
 	$(CXX) $(CXXFLAGS) -o $@ $<
 
 opttest: tests/test_opt.cpp src/*.hpp
+	$(CXX) $(CXXFLAGS) -o $@ $<
+
+db: src/db.cpp src/*.hpp
 	$(CXX) $(CXXFLAGS) -o $@ $<
 
 test: $(TESTS)

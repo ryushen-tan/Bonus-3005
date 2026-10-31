@@ -55,27 +55,50 @@ The resolution rules, in the order they are checked (`SqlCompiler::resolveColumn
    `ambiguity: column did is ambiguous, it could be Emp.did or Dept.did`, naming every candidate (case 3).
 4. `SELECT *` expands to every column of every entry, in FROM order and then schema order, each written
    with its entry name. So two tables sharing a column name are not an error there (case 2).
-5. `ORDER BY` first looks for an alias given in the select list, then resolves against the FROM scope.
-   A column the select list does not have is allowed (case 9, below), except with `SELECT DISTINCT`,
-   where it would change which rows are distinct (PostgreSQL refuses it too).
-6. An unknown table is `name: unknown table Nope` at the table's position, a different message from an
+5. `ORDER BY c`, with `c` alone, first looks for an output column named `c`: an alias, an aggregate's
+   output name, or the name of a column selected without an alias. Two output columns named `c` from
+   different sources are `ambiguity: ORDER BY c is ambiguous` (`SELECT name AS age, age ... ORDER BY
+   age`, as in PostgreSQL); the same column twice is not. Otherwise, and always for `t.c`, it resolves
+   against the FROM scope. A key that the select list shows under an alias sorts by the alias (`SELECT c
+   AS x ... ORDER BY c` sorts by `x`). A column the select list does not have is allowed (case 9, below),
+   except with `SELECT DISTINCT`, where it would change which rows are distinct (PostgreSQL refuses it
+   too).
+6. `GROUP BY c`, with `c` alone, is a FROM column when one has that name and otherwise the column that
+   a select list alias `c` names (`SELECT did AS dd ... GROUP BY dd`), as in PostgreSQL. An alias of an
+   aggregate is an aggregate error there. A column grouped twice is one key.
+7. An unknown table is `name: unknown table Nope` at the table's position, a different message from an
    unknown column (case 11).
 
-`JOIN ... ON` conditions are resolved against the scope as it stands when the join is reached, that is
-the tables to its left and the table being joined. After this pass every column in the plan is written
-qualified (`Emp.age`, `e.did`). The only unqualified names in a plan are the output names of aggregates
-(`n`, `count_star`), which belong to no table; the executor's resolution treats them as columns of no
-relation.
+A `JOIN ... ON` condition is resolved against the tables of its own chain only, the ones to its left in
+the chain and the one being joined: JOIN binds tighter than the comma, so in `FROM Dept d, Emp e JOIN
+Works w ON ...` the condition cannot use `d`, which is PostgreSQL's rule too. After this pass every
+column in the plan is written qualified (`Emp.age`, `e.did`). The only unqualified names in a plan are
+aliases and the output names of aggregates (`n`, `count_star`), which belong to no table. The rule that
+Module 2 and the optimizer resolve a name alone by (`resolve` in `algebra.hpp`) is: the column of no
+relation with that name when there is one, and otherwise the one qualified column with that name. So
+`SELECT d.did AS budget FROM Dept d ORDER BY d.budget` works although its projection holds both
+`budget` and `d.budget`.
+
+**Output names.** An output column has the name of its alias, its aggregate or its column. A later
+column with the qualified name of an earlier one gets `_2`, `_3`, ...: `SELECT name, name` gives
+`Emp.name` and `name_2`, `SELECT COUNT(*), COUNT(*)` computes the count once and gives `count_star` and
+`count_star_2`. A subquery in FROM gets its alias on every column, so `(SELECT t.pid, w.pid ...) AS s`
+would have `s.pid` twice; its later columns are renamed the same way (`s.pid`, `s.pid_2`) by a
+`project` under the `rename`. PostgreSQL keeps both names and refuses `s.pid` as ambiguous; a schema
+here cannot hold one qualified name twice, so the second column needs a name of its own.
 
 ## 3 Type rules
 
 Comparisons need the same type on both sides, equality included, as in Bonus Project 1. INT, and the
 numeric results of aggregates, compare with each other. VARCHAR compares only with VARCHAR. Case 10 is
-`type: cannot compare age (INT) with '30' (VARCHAR(2))`. `SUM` and `AVG` need an INT column, `COUNT`
-takes anything, `MIN` and `MAX` take either type. The set operators need the same number of columns and
+`type: cannot compare age (INT) with '30' (VARCHAR(2))`. `SUM` and `AVG` need a number: an INT column, or
+the BIGINT of a SUM or the REAL of an AVG computed in a subquery. `SUM` gives a BIGINT, or a REAL over a
+REAL, and `AVG` a REAL. `COUNT` takes anything, `MIN` and `MAX` take either type. The set operators need the same number of columns and
 comparable types in each position (case 14), and the output takes the left input's names. `INSERT`
 checks the number of values, each value's type against its column, that an INT fits in 32 bits and that
-a string fits its VARCHAR.
+a string fits its VARCHAR. Every integer literal is an INT, so one outside -2147483648 to 2147483647 is a
+type error that says so, also in a comparison (`WHERE a < 3000000000`), where PostgreSQL would make it
+a BIGINT.
 
 ## 4 Aggregation rules
 
@@ -83,8 +106,9 @@ A query block aggregates when it has GROUP BY, or an aggregate in its select lis
 select list may hold only grouping columns and aggregates (case 6), as may HAVING and ORDER BY. An
 aggregate in WHERE is always an error, because WHERE runs before grouping (case 7). One `group_by` node
 computes every aggregate the block uses: the ones in the select list, then any that only HAVING or
-ORDER BY mention, which are carried as extra output columns and projected away. Two identical aggregates
-without aliases (`COUNT(*)` in the select list and in HAVING) are computed once.
+ORDER BY mention, which are carried as extra output columns and projected away. An aggregate without an
+alias that is identical to one already computed (`COUNT(*)` in the select list and in HAVING) is that
+one, computed once.
 
 **Aggregate naming rule.** The output column of an aggregate is named by its `AS` alias when it has one
 (`COUNT(*) AS n` gives `n`). Otherwise the name is the function, an underscore, and the qualified
@@ -92,7 +116,10 @@ column with its dot replaced by an underscore: `count_star` for `COUNT(*)`, `avg
 `AVG(salary)` over `Emp`, and `sum_e_salary` for `SUM(e.salary)`. This is the rule the Module 2
 document's group_by example uses, so a plan from this module and one written by hand name things the
 same way. HAVING refers to aggregates by these names: `HAVING COUNT(*) > 5` becomes `select n > 5`
-above the group_by when the select list called it `n`.
+above the group_by when the select list called it `n`. A default name that an alias of the select list
+or another aggregate already has, and an alias that another aggregate already has, gets `_2`, `_3`, ...:
+in `SELECT did AS count_star, COUNT(*) ... GROUP BY did` the count is `count_star_2`, so ORDER BY
+`count_star` still means the alias.
 
 ## 5 Translation
 
@@ -101,7 +128,8 @@ decisions:
 
 1. FROM: each table reference is a `scan`, with a `rename` above it when it has an alias. Each
    `JOIN ... ON` chain becomes `join` nodes, left deep, carrying their ON condition. The comma separated
-   chains are combined by `cross` nodes, left deep.
+   chains are combined by `cross` nodes, left deep. A subquery is its own plan under a `rename`, with a
+   `project` between them only when two of its columns share a name (section 2).
 2. WHERE: one `select` with the whole condition, unchanged. The predicate stays above the joins even
    when it touches one table; moving it is Module 4's job (example 5.2).
 3. GROUP BY: one `group_by` with the grouping columns and every aggregate, even when there is no GROUP BY
@@ -119,14 +147,17 @@ decisions:
 Conditions are written into the plan as text in Bonus Project 1's condition language (`and`, `or`,
 `not`, `!=`). The text is printed from a Bonus 1 condition tree, built from the SQL condition after
 resolution, by the same `condText` that the plan JSON round trip uses. So parentheses appear exactly
-where the grammar needs them, and Module 2 parses the text back with `parseCondition`.
+where the grammar needs them, and Module 2 parses the text back with `parseCondition`. The SQL tree holds
+a chain of ORs or ANDs as one node with all its operands; the Bonus 1 tree is binary and left deep, and
+`mk` counts such a chain as one level of nesting, so a 1000 term OR is as acceptable as a short one.
 
 ## 6 Errors
 
 Everything is reported as `error: <category>: <message> at line L, column C` with one of the seven
 categories (lexical, syntax, name, ambiguity, type, aggregate, schema), at the first error, with no stack
 trace. `sql check` prints nothing and exits 0 when the file is correct, and prints the error and exits 1
-otherwise. In a script, `CREATE TABLE` adds the table to what later statements see, without touching the
+otherwise. A statement past the limits of GRAMMAR_SQL.md section 5 (450 levels of nesting, 1000
+comparisons in a condition, 1000 set operators) is a syntax error in the same form, never a crash. In a script, `CREATE TABLE` adds the table to what later statements see, without touching the
 database, so a file that creates a table and then queries it compiles.
 
 ## 7 Sources and what they changed

@@ -5,7 +5,7 @@
 
 inline Optimizer optimizerFor(Database& db, const Args& a) {
     Optimizer o{db, a.number("frames", 32), {}, {}};
-    if (o.frames < 3) throw Error{"error: --frames must be at least 3"};
+    if (o.frames < MIN_PLAN_FRAMES) throw Error{"error: --frames must be at least " + std::to_string(MIN_PLAN_FRAMES)};
     for (char rule : a.get("without-rules", "")) {
         if (rule < '1' || rule > '7') throw Error{"error: --without-rules takes rule numbers 1 to 7, like 26"};
         o.disabled.insert(rule - '0');
@@ -39,7 +39,7 @@ inline int optTool(const std::vector<std::string>& args, std::ostream& out) {
         LogicalNode given = logicalFromJson(parseJson(readFile(a.need("logical"))));
         o.outputCols(given);
         LogicalNode plan = a.has("baseline") ? o.baseline(given) : o.optimize(given);
-        if (a.has("baseline")) o.estimate(plan);
+        if (a.has("baseline")) o.estimate(plan, o.frames);
         if (a.command == "plan") out << dumpJson(physicalJson(plan)) << '\n';
         else if (a.command == "dp-table") {
             if (o.dpTable.empty()) out << "there is no join in this plan\n";
@@ -57,5 +57,7 @@ inline int optTool(const std::vector<std::string>& args, std::ostream& out) {
         return 0;
     } catch (const Error& e) {
         return report(e, out);
+    } catch (const std::exception& e) {
+        return report(Error{std::string("internal error: ") + e.what()}, out);
     }
 }

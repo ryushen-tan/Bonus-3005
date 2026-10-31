@@ -41,6 +41,9 @@ struct Operator {
     virtual bool produce(Row& row) = 0;
     virtual void finish() {}
     virtual bool holdsMemory() const { return false; }
+    // whether a memory-holding parent writes this operator's output to a temporary file before taking any
+    // memory of its own
+    virtual bool writtenForParent() const { return holdsMemory(); }
     int available() const { return db.pool.freeFrames() - parentFrames; }
 };
 
@@ -65,7 +68,7 @@ struct Packing {
         if (pages > 0 && room >= need) { room -= need; return true; }
         if (pages == limit) return false;
         pages++;
-        room = need > size_t(MAX_RECORD) ? 0 : MAX_RECORD - need;
+        room = need > size_t(USABLE_SPACE) ? 0 : USABLE_SPACE - need;
         return true;
     }
 };
@@ -175,11 +178,11 @@ struct ChildSource : TupleSource {
 };
 struct RunSource : TupleSource {
     Run run;
-    RunReader reader;
-    RunSource(Database& db, Run r, const std::vector<Col>& schema) : run(std::move(r)), reader(db, schema) { reader.start(run); }
-    bool next(Row& row) override { return reader.next(row); }
-    void rewind() override { reader.start(run); }
-    void close() override {}
+    std::unique_ptr<RunReader> reader;
+    RunSource(Database& db, Run r, const std::vector<Col>& schema) : run(std::move(r)), reader(std::make_unique<RunReader>(db, schema)) { reader->start(run); }
+    bool next(Row& row) override { return reader->next(row); }
+    void rewind() override { reader->start(run); }
+    void close() override { reader.reset(); }
     int framesToCome() const override { return 0; }
 };
 
@@ -358,6 +361,11 @@ inline bool sameKey(const Row& a, const std::vector<size_t>& ka, const Row& b, c
     return true;
 }
 inline Row joined(const Row& a, const Row& b) { Row r = a; r.insert(r.end(), b.begin(), b.end()); return r; }
+// a set operation's column is REAL when either input's is, and an INT in it takes the REAL form, so the
+// column prints one way whether or not its values went through a temporary file
+inline void widen(Row& row, const std::vector<Col>& from, const std::vector<Col>& to) {
+    for (size_t i = 0; i < row.size(); i++) if (to[i].type == RealT && from[i].type != RealT) row[i] = realValue(row[i].num);
+}
 
 // ---- the operators ----
 
@@ -395,7 +403,7 @@ struct Projection : Operator {
         Row in;
         if (!children[0]->next(in)) return false;
         row.clear();
-        for (size_t c : columns) row.push_back(std::move(in[c]));
+        for (size_t c : columns) row.push_back(in[c]);
         return true;
     }
     void finish() override { children[0]->close(); }
@@ -426,12 +434,14 @@ struct UnionAll : Operator {
     UnionAll(Database& d) : Operator(d, "union_all") {}
     void start() override { side = 0; children[0]->open(); }
     bool produce(Row& row) override {
-        if (children[side]->next(row)) return true;
-        if (side == 1) return false;
-        children[0]->close();
-        side = 1;
-        children[1]->open();
-        return children[1]->next(row);
+        while (!children[side]->next(row)) {
+            if (side == 1) return false;
+            children[0]->close();
+            side = 1;
+            children[1]->open();
+        }
+        widen(row, children[side]->schema, schema);
+        return true;
     }
     void finish() override { children[side]->close(); }
 };
@@ -457,25 +467,37 @@ struct Sort : Operator {
 };
 
 // both sort and hash modes of distinct and group_by share the aggregate arithmetic
-struct Aggregate { std::string func; long long column; std::string name; };
-struct AggState { long long count = 0, sum = 0; Value min, max; };
+// real: the summed column is a REAL (an AVG from below), so its sum is kept as a double
+struct Aggregate { std::string func; long long column; std::string name; bool real = false; };
+struct AggState { long long count = 0, sum = 0; double realSum = 0; Value extreme; };
 inline void accumulate(std::vector<AggState>& states, const std::vector<Aggregate>& aggs, const Row& row) {
     for (size_t i = 0; i < aggs.size(); i++) {
         AggState& s = states[i];
         s.count++;
         if (aggs[i].column < 0) continue;
         const Value& v = row[size_t(aggs[i].column)];
-        if (aggs[i].func == "sum" || aggs[i].func == "avg") s.sum += (long long)v.num;
-        if (s.count == 1 || compare(v, s.min) < 0) s.min = v;
-        if (s.count == 1 || compare(v, s.max) > 0) s.max = v;
+        if ((aggs[i].func == "sum" || aggs[i].func == "avg") && aggs[i].real) s.realSum += v.num;
+        else if (aggs[i].func == "sum" || aggs[i].func == "avg") s.sum += (long long)v.num;
+        if (aggs[i].func == "min" && (s.count == 1 || compare(v, s.extreme) < 0)) s.extreme = v;
+        if (aggs[i].func == "max" && (s.count == 1 || compare(v, s.extreme) > 0)) s.extreme = v;
+    }
+}
+inline void combine(std::vector<AggState>& states, const std::vector<AggState>& more, const std::vector<Aggregate>& aggs) {
+    for (size_t i = 0; i < aggs.size(); i++) {
+        AggState& s = states[i];
+        if (aggs[i].func == "min" && compare(more[i].extreme, s.extreme) < 0) s.extreme = more[i].extreme;
+        if (aggs[i].func == "max" && compare(more[i].extreme, s.extreme) > 0) s.extreme = more[i].extreme;
+        s.count += more[i].count;
+        s.sum += more[i].sum;
+        s.realSum += more[i].realSum;
     }
 }
 inline Value aggregateResult(const AggState& s, const Aggregate& a) {
     if (a.func == "count") return intValue(s.count);
     if (s.count == 0) throw Error{"error: " + a.func + " of an empty input with no grouping columns is undefined"};
-    if (a.func == "sum") return intValue(s.sum);
-    if (a.func == "avg") return realValue(double(s.sum) / double(s.count));
-    return a.func == "min" ? s.min : s.max;
+    if (a.func == "sum") return a.real ? realValue(s.realSum) : intValue(s.sum);
+    if (a.func == "avg") return realValue((a.real ? s.realSum : double(s.sum)) / double(s.count));
+    return s.extreme;
 }
 
 struct DistinctBase : Operator {
@@ -522,7 +544,10 @@ struct SortGroupBy : Operator {
     Row pending;
     bool havePending = false, emittedEmpty = false;
     SortGroupBy(Database& d) : Operator(d, "group_by") { detail = "sort"; }
-    bool holdsMemory() const override { return true; }
+    // with no keys there is one group, aggregated as the input streams past. Its one row is still written
+    // for a parent, so that a nested loop join does not aggregate the whole input again for every block
+    bool holdsMemory() const override { return !keyColumns.empty(); }
+    bool writtenForParent() const override { return true; }
     void start() override {
         std::unique_ptr<TupleSource> in = inputOf(*this, 0, spill);
         emittedEmpty = false;
@@ -563,62 +588,122 @@ struct SortGroupBy : Operator {
     void finish() override { sorter.reset(); plain.reset(); }
 };
 
-// hash mode of distinct and group_by: groups go into an in-memory table while it has room; a tuple whose
-// group is not in a full table is written to one of P partitions instead, and each partition is then
-// handled the same way with a different hash function
+// hash mode of distinct and group_by, partitioned like the grace hash join. The groups go into a table that
+// has every frame free beside the input page, and when they all fit that is the only pass. The first group
+// that does not fit sends the table, written out, and the rest of the input to one partition per frame, and
+// each partition is then handled the same way with the next level's hash functions. A partition holds
+// groups, not input tuples: the key columns, then each aggregate's count and its sum or its min or max
 struct HashGrouping {
     Database& db;
     const std::vector<Col>& inputSchema;
-    std::vector<size_t> keyColumns;
+    std::vector<size_t> keyColumns, keyPositions;
     const std::vector<Aggregate>& aggs;
     unsigned long long& comparisons;
+    std::vector<Col> keySchema, stateSchema;
+    // the most an entry's aggregates can take, a VARCHAR min or max at its declared length because it can grow
+    size_t stateBytes = 0;
     std::unique_ptr<SpillFile> spill;
-    Frames table;
-    int partitions = 0, tablePages = 0;
-    struct Entry { Row row; std::vector<AggState> states; };
+    Frames frames;
+    int work = 0, levels = 0;
+    struct Entry { Row key; std::vector<AggState> states; };
     std::vector<Entry> entries;
     std::vector<std::vector<int>> buckets;
     std::deque<std::pair<Run, int>> pending;
     std::vector<std::string> sizes;
 
     HashGrouping(Database& d, const std::vector<Col>& s, std::vector<size_t> keys, const std::vector<Aggregate>& a, unsigned long long& c)
-        : db(d), inputSchema(s), keyColumns(std::move(keys)), aggs(a), comparisons(c), table(d.pool) {}
+        : db(d), inputSchema(s), keyColumns(std::move(keys)), aggs(a), comparisons(c), frames(d.pool) {
+        for (size_t k : keyColumns) { keyPositions.push_back(keySchema.size()); keySchema.push_back(inputSchema[k]); }
+        stateSchema = keySchema;
+        for (const Aggregate& aggregate : aggs) {
+            stateSchema.push_back({"", "count", BigT});
+            if (aggregate.func == "sum" || aggregate.func == "avg") stateSchema.push_back({"", "sum", aggregate.real ? RealT : BigT});
+            if (aggregate.func == "min" || aggregate.func == "max") stateSchema.push_back(inputSchema[size_t(aggregate.column)]);
+        }
+        for (size_t i = keySchema.size(); i < stateSchema.size(); i++)
+            stateBytes += stateSchema[i].type == StrT ? 2 + size_t(stateSchema[i].length) : stateSchema[i].type == IntT ? 4 : 8;
+    }
 
-    // the frames the table and the partition buffers get, out of what is free beside the input page
-    void plan(int work) {
-        if (work < 2) throw Error{"error: hash grouping needs at least 3 frames, " + std::to_string(work + 1) + " are free"};
-        partitions = std::max(1, work / 2);
-        tablePages = work - partitions;
-        table.take(tablePages);
+    // the frames free beside the input page, every one of them the table's and then a partition's
+    void plan(int free) {
+        if (free < 2) throw Error{"error: hash grouping needs at least 3 frames, " + std::to_string(free + 1) + " are free"};
+        work = free;
     }
-    size_t entryBytes(const Row& row) {
-        size_t n = 16 * aggs.size();
-        for (size_t c : keyColumns) n += inputSchema[c].type == StrT ? 2 + row[c].text.size() : 8;
-        return n;
+    uint32_t spillFile() { if (!spill) spill = std::make_unique<SpillFile>(db); return spill->file; }
+    Entry groupOf(const Row& tuple) const {
+        Entry e{{}, std::vector<AggState>(aggs.size())};
+        for (size_t k : keyColumns) e.key.push_back(tuple[k]);
+        accumulate(e.states, aggs, tuple);
+        return e;
     }
-    // one pass over an input at a hash level: fills the table, spills the rest to new partitions
-    void consume(TupleSource& in, int level) {
+    Entry entryOf(const Row& record) const {
+        size_t at = keySchema.size();
+        Entry e{Row(record.begin(), record.begin() + at), std::vector<AggState>(aggs.size())};
+        for (size_t i = 0; i < aggs.size(); i++) {
+            AggState& s = e.states[i];
+            s.count = std::stoll(record[at++].text);
+            if ((aggs[i].func == "sum" || aggs[i].func == "avg") && aggs[i].real) s.realSum = record[at++].num;
+            else if (aggs[i].func == "sum" || aggs[i].func == "avg") s.sum = std::stoll(record[at++].text);
+            if (aggs[i].func == "min" || aggs[i].func == "max") s.extreme = record[at++];
+        }
+        return e;
+    }
+    Row recordOf(const Entry& e) const {
+        Row record = e.key;
+        for (size_t i = 0; i < aggs.size(); i++) {
+            record.push_back(intValue(e.states[i].count));
+            if (aggs[i].func == "sum" || aggs[i].func == "avg")
+                record.push_back(aggs[i].real ? realValue(e.states[i].realSum) : intValue(e.states[i].sum));
+            if (aggs[i].func == "min" || aggs[i].func == "max") record.push_back(e.states[i].extreme);
+        }
+        return record;
+    }
+    // a record's key columns come first, so the same positions find the key of an entry and of a record.
+    // The low bits of an FNV-1a hash split the keys the same way whatever the seed, so a partition would
+    // never split again on a power of two frames; murmur3's finaliser makes every bit depend on the seed
+    uint64_t hashOf(const Row& keyFirst, uint64_t seed) const {
+        uint64_t h = hashKey(keyFirst, keyPositions, seed);
+        h ^= h >> 33; h *= 0xff51afd7ed558ccdULL; h ^= h >> 33; h *= 0xc4ceb9fe1a85ec53ULL; h ^= h >> 33;
+        return h;
+    }
+    size_t partitionOf(const Row& keyFirst, int level) const { return hashOf(keyFirst, uint64_t(2 * level + 2)) % size_t(work); }
+    // the table written out through one of its own frames, which then all become partition buffers
+    Run writeTable() {
+        RunWriter writer(db, spillFile(), stateSchema, frames.held[0], false);
+        for (const Entry& e : entries) writer.add(recordOf(e));
         entries.clear();
-        buckets.assign(size_t(tablePages) * 64, {});
-        std::vector<std::unique_ptr<RunWriter>> writers;
+        Run table = writer.finish();
+        frames.releaseAll();
+        return table;
+    }
+    // one pass over an input at a hash level
+    void consume(TupleSource& in, int level) {
+        frames.take(work);
+        buckets.assign(size_t(work) * 64, {});
         Packing pack;
+        Run table;
+        std::vector<std::unique_ptr<RunWriter>> writers;
         Row row;
         while (in.next(row)) {
-            uint64_t h = hashKey(row, keyColumns, uint64_t(2 * level + 1));
-            std::vector<int>& bucket = buckets[h % buckets.size()];
-            int found = -1;
-            for (int e : bucket) { comparisons++; if (sameKey(entries[size_t(e)].row, keyColumns, row, keyColumns)) { found = e; break; } }
-            if (found < 0 && pack.add(entryBytes(row), tablePages)) {
-                found = int(entries.size());
-                bucket.push_back(found);
-                entries.push_back({row, std::vector<AggState>(aggs.size())});
-            }
-            if (found >= 0) { accumulate(entries[size_t(found)].states, aggs, row); continue; }
+            Entry e = level == 0 ? groupOf(row) : entryOf(row);
             if (writers.empty()) {
-                if (!spill) spill = std::make_unique<SpillFile>(db);
-                for (int p = 0; p < partitions; p++) writers.push_back(std::make_unique<RunWriter>(db, spill->file, inputSchema));
+                std::vector<int>& bucket = buckets[hashOf(e.key, uint64_t(2 * level + 1)) % buckets.size()];
+                int found = -1;
+                for (int x : bucket) { comparisons++; if (same(entries[size_t(x)].key, e.key)) { found = x; break; } }
+                if (found >= 0) { combine(entries[size_t(found)].states, e.states, aggs); continue; }
+                if (pack.add(encodedSize(keySchema, e.key) + stateBytes, work)) { bucket.push_back(int(entries.size())); entries.push_back(std::move(e)); continue; }
+                table = writeTable();
+                for (int p = 0; p < work; p++) writers.push_back(std::make_unique<RunWriter>(db, spillFile(), stateSchema));
             }
-            writers[hashKey(row, keyColumns, uint64_t(2 * level + 2)) % size_t(partitions)]->add(row);
+            writers[partitionOf(e.key, level)]->add(recordOf(e));
+        }
+        in.close();
+        if (writers.empty()) return;
+        levels = std::max(levels, level + 1);
+        {
+            RunReader reader(db, stateSchema);
+            reader.start(table);
+            while (reader.next(row)) writers[partitionOf(row, level)]->add(row);
         }
         for (auto& w : writers) {
             Run r = w->finish();
@@ -629,13 +714,19 @@ struct HashGrouping {
     // the next partition into the table, false when there is none left
     bool nextPartition() {
         if (pending.empty()) return false;
+        entries.clear();
+        frames.releaseAll();
         auto [run, level] = std::move(pending.front());
         pending.pop_front();
-        RunSource in(db, std::move(run), inputSchema);
+        RunSource in(db, std::move(run), stateSchema);
         consume(in, level);
         return true;
     }
-    void close() { entries.clear(); buckets.clear(); pending.clear(); table.releaseAll(); spill.reset(); }
+    std::string notes() const {
+        std::string pages;
+        for (size_t i = 0; i < sizes.size(); i++) pages += (i ? "," : "") + sizes[i];
+        return "levels=" + std::to_string(levels) + " partitions=" + std::to_string(work) + " spilled_pages=[" + pages + "]";
+    }
 };
 
 struct HashDistinct : DistinctBase {
@@ -657,11 +748,10 @@ struct HashDistinct : DistinctBase {
     }
     bool produce(Row& row) override {
         while (at == grouping->entries.size()) { if (!grouping->nextPartition()) return false; at = 0; }
-        row = grouping->entries[at++].row;
+        row = grouping->entries[at++].key;
         return true;
     }
-    void finish() override { notes = "partitions=" + std::to_string(grouping->partitions) + " spilled_pages=[" + join(grouping->sizes) + "]"; grouping.reset(); }
-    static std::string join(const std::vector<std::string>& xs) { std::string s; for (size_t i = 0; i < xs.size(); i++) s += (i ? "," : "") + xs[i]; return s; }
+    void finish() override { notes = grouping->notes(); grouping.reset(); }
 };
 
 struct HashGroupBy : Operator {
@@ -694,12 +784,11 @@ struct HashGroupBy : Operator {
         }
         const HashGrouping::Entry& e = grouping->entries[at++];
         emittedEmpty = true;
-        row.clear();
-        for (size_t c : keyColumns) row.push_back(e.row[c]);
+        row = e.key;
         for (size_t i = 0; i < aggs.size(); i++) row.push_back(aggregateResult(e.states[i], aggs[i]));
         return true;
     }
-    void finish() override { notes = "partitions=" + std::to_string(grouping->partitions) + " spilled_pages=[" + HashDistinct::join(grouping->sizes) + "]"; grouping.reset(); }
+    void finish() override { notes = grouping->notes(); grouping.reset(); }
 };
 
 // a join condition: the whole condition for the nested loop, and for the equality joins the columns of
@@ -766,9 +855,14 @@ struct NestedLoopJoin : Operator {
     Frames block;
     NestedLoopJoin(Database& d) : Operator(d, "nested_loop_join"), block(d.pool) {}
     bool holdsMemory() const override { return true; }
+    // the inner is written to the temporary file before the outer's reader takes its frame, so each is
+    // materialised with every frame free
     void start() override {
+        std::unique_ptr<Run> innerRun;
+        if (materialize[1]) innerRun = std::make_unique<Run>(materialized(*this, 1, spill));
         outer = inputOf(*this, 0, spill);
-        inner = inputOf(*this, 1, spill);
+        if (innerRun) inner = std::make_unique<RunSource>(db, std::move(*innerRun), children[1]->schema);
+        else inner = std::make_unique<ChildSource>(*children[1]);
         int pages = available() - outer->framesToCome() - inner->framesToCome();
         if (pages < 1) throw Error{"error: nested_loop_join needs at least 3 frames, " + std::to_string(available()) + " are free"};
         loop = std::make_unique<BlockLoop>(*outer, *inner, children[0]->schema, join.cond.get(), counters.comparisons, pages, block);
@@ -957,13 +1051,15 @@ struct SortUnion : Operator {
         size_t side = 0;
         Both(SortUnion& u, std::unique_ptr<Run> r) : op(u), right(std::move(r)), current(inputOf(u, 0, u.spill)) {}
         bool next(Row& row) override {
-            if (current->next(row)) return true;
-            if (side == 1) return false;
-            current.reset();
-            side = 1;
-            if (right) current = std::make_unique<RunSource>(op.db, std::move(*right), op.children[1]->schema);
-            else current = std::make_unique<ChildSource>(*op.children[1]);
-            return current->next(row);
+            while (!current->next(row)) {
+                if (side == 1) return false;
+                current.reset();
+                side = 1;
+                if (right) current = std::make_unique<RunSource>(op.db, std::move(*right), op.children[1]->schema);
+                else current = std::make_unique<ChildSource>(*op.children[1]);
+            }
+            widen(row, op.children[side]->schema, op.schema);
+            return true;
         }
         void rewind() override {}
         void close() override { current.reset(); }
@@ -1039,7 +1135,7 @@ struct SetDifference : Operator {
                 counters.comparisons++;
                 if (!same(a, row)) break;
             }
-            if (onRight == intersect) return true;
+            if (onRight == intersect) { widen(row, children[0]->schema, schema); return true; }
         }
         return false;
     }

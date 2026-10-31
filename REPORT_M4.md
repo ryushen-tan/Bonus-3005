@@ -11,7 +11,8 @@ company dataset and a twenty query workload (`perf/m4_queries.sql`) to stand in 
 (15000, 59). Two columns are strongly correlated on purpose: `Emp.level` is uniform on 1 to 8, and
 `Emp.salary` is 20000 · level plus up to 15000. And 30% of Works rows are for project 7, a skewed join key.
 All four tables are ANALYZEd with 20 buckets. The same generator and queries are what
-`tests/e2e/run.py` checks against PostgreSQL; all 258 runs agree.
+`tests/e2e/run.py` checks against PostgreSQL, through the four tools chained by file and through the `db`
+shell; all 390 runs agree, at scale 1 and at scale 5.
 
 The workload's multi-way joins are written with JOIN ON. The unoptimised plan (`opt plan --baseline`:
 joins in written order, every join a nested loop, nothing pushed down) of a comma join is a cross
@@ -86,29 +87,32 @@ Actual page I/O at B = 16 of the optimised plan and of the unoptimised one.
 | 9 | 127 | BNL BNL BNL | 1413 | 11.13 |
 | 10 | 155 | BNL BNL | 1082 | 6.98 |
 | 11 | 64 | - | 182 | 2.84 |
-| 12 | 82 | BNL | 156 | 1.90 |
-| 13 | 143 | BNL | 409 | 2.86 |
+| 12 | 64 | BNL | 80 | 1.25 |
+| 13 | 101 | BNL | 409 | 4.05 |
 | 14 | 111 | BNL | 173 | 1.56 |
 | 15 | 57 | BNL | 63 | 1.11 |
 | 16 | 8 | BNL | 10 | 1.25 |
 | 17 | 115 | BNL | 295 | 2.57 |
 | 18 | 57 | - | 57 | 1.00 |
 | 19 | 123 | BNL BNL | 827 | 6.72 |
-| 20 | 117 | BNL | 361 | 3.09 |
+| 20 | 115 | BNL | 295 | 2.57 |
 
-**The ratio ranges from 1.00 to 11.13, median 2.19.**
+**The ratio ranges from 1.00 to 11.13, median 2.02.**
 - **Single-table queries (1 to 3, 18) gain nothing:** there is one way to scan a table.
-- **The large gains are the multi-way joins.** Query 9 (11×) joins four tables. The optimiser starts
-  from the 10 Ottawa departments, joins Proj, then the 1875 filtered Works rows, and Emp last, so
+- **The large gains are the multi-way joins.** Query 9 (11×) joins four tables. The optimiser joins
+  Proj to the 10 Ottawa departments first, then the 1875 filtered Works rows, and Emp last, so
   every intermediate result fits in one block. Written order starts with Emp ⋈ Works, 5000 × 15000 rows
   of nested loop, and filters only at the top.
-- **Group-by queries (6, 8, 11):** a hash group_by of 54 pages in memory instead of an external sort.
+- **Group-by queries (6, 8, 11, 13):** the group_by hashes its input in memory, where the unoptimised
+  plan sorts it externally.
 - **The rest** is projection pushdown making the nested loop's blocks hold more tuples.
 
-All the joins chosen at B = 16 are nested loops. With B − 2 = 14 frames of block, the filtered and
-projected outer sides here are a page or two, so one pass over the inner is the cheapest possible join.
-At B = 4 the same workload chooses hash and sort-merge joins in several places (the test `changing B
-changes the join algorithm` checks one).
+All the joins chosen at B = 16 are nested loops. With 13 or 14 frames of block (B − 3 for a join below
+another join, B − 2 at the top), the filtered and projected outer sides here are a page or two, so one
+pass over the inner is the cheapest possible join. At B = 4 the same workload chooses hash joins in four
+queries: 9 (the middle of its three joins), 10 (both joins), 19 (the upper of its two) and 20. No query
+chooses a sort-merge join at any of B = 4, 8 or 16. The test `changing B changes the join algorithm`
+checks one query whose algorithm changes with B.
 
 ## 3 Which rule mattered
 
@@ -116,14 +120,14 @@ Total actual I/O of the twenty queries with one rule turned off (`opt plan --wit
 
 | rule turned off | total I/O | against all rules on |
 |---|---|---|
-| none | 1660 | 1.00 |
-| 1 split conjunctions | 2124 | 1.28 |
-| 2 push selects below joins | 3196 | 1.93 |
-| 3 cross plus equality becomes a join | 1660 | 1.00 |
-| 4 push selects below rename and union | 1660 | 1.00 |
-| 5 push selects below group_by | 1660 | 1.00 |
-| 6 push projections down | 2058 | 1.24 |
-| 7 tidy projections and selects | 1660 | 1.00 |
+| none | 1598 | 1.00 |
+| 1 split conjunctions | 2062 | 1.29 |
+| 2 push selects below joins | 3134 | 1.96 |
+| 3 cross plus equality becomes a join | 1598 | 1.00 |
+| 4 push selects below rename and union | 1598 | 1.00 |
+| 5 push selects below group_by | 1598 | 1.00 |
+| 6 push projections down | 1916 | 1.20 |
+| 7 tidy projections and selects | 1598 | 1.00 |
 
 - **Rule 2** is worth the most: without it, filters on Emp and Works stay above the joins, so nested
   loops carry 5000 and 15000 row inputs instead of a few hundred.
@@ -133,8 +137,11 @@ Total actual I/O of the twenty queries with one rule turned off (`opt plan --wit
   rows.
 
 **Four rules are worth nothing on this workload, each for a reason**:
-- **Rule 3** only fires on a comma join. Query 5 is the one comma join, and there the other side is
-  Dept, one page. A cross product followed by a filter reads Dept once per block of Emp, and so does
+- **Rule 3** fires on a WHERE equality between a column of each side of a join: on a comma join it
+  turns the cross product into a join, and on a JOIN ON it adds the equality to the ON condition, as
+  in `SELECT COUNT(*) FROM Emp e JOIN Dept d ON e.did = d.did WHERE e.city = d.city;`. In this
+  workload only query 5, the one comma join, has such an equality, and there the other side is Dept,
+  one page. A cross product followed by a filter reads Dept once per block of Emp, and so does
   the join. Rule 3 saves CPU (pairs compared) but no I/O here. On query 9 written with commas it would
   matter enormously, because the unoptimised four way cross product is billions of rows.
 - **Rule 4** has nothing to do in this workload's subquery (query 8), because the select on `t.n` meets a
@@ -176,15 +183,14 @@ nested_loop_join (e.eid = w.eid)                        est_rows=889      est_co
     seqscan Works                                       est_cost=236
 ```
 
-282 estimated rows fit in the nested loop's 2 page block, so the optimiser expects one pass over Works:
-219 + 2 × 236 = 691. **What happened**:
+282 estimated rows are 3 pages (`opt dp-table` gives {e} rows=282 pages=3), two blocks of the nested
+loop's 2 pages, so the optimiser expects two passes over Works: 219 + 2 × 236 = 691. **What happened**:
 
 ```
-nested_loop_join     tuples_out=7409     comparisons=148020000   block_pages=2 blocks=12
-  filter             tuples_out=2467
-    seqscan Emp      reads=220
-  seqscan Works      tuples_out=720000   reads=2844
-total: reads=3064 writes=0 peak_frames=4
+nested_loop_join tuples_out=7409 comparisons=148020000 reads=0 writes=0 block_pages=2 blocks=12
+  filter tuples_out=2467 comparisons=20000 reads=0 writes=0
+    seqscan Emp tuples_out=20000 comparisons=0 reads=220 writes=0
+  seqscan Works tuples_out=720000 comparisons=0 reads=2844 writes=0
 ```
 
 2467 rows need 12 blocks, so Works was scanned 12 times: 3064 page I/Os against the 691 estimated.
@@ -259,30 +265,31 @@ Query 9, at B = 16 (also in `perf/m4/results.md`, with its explain):
 {p,d}  rows=100 pages=2    {d} outer, nested_loop_join with p inner  cost=4
 {p,d}  rows=100 pages=2    {d} outer, hash_join with p inner  cost=12
 {p,d}  rows=100 pages=2    {d} outer, sort_merge_join with p inner  cost=8
-{e,w,p}  rows=1875 pages=32    {e,w} outer, nested_loop_join with p inner  cost=143
+{e,w,p}  rows=1875 pages=32  * {e,w} outer, nested_loop_join with p inner  cost=143
 {e,w,p}  rows=1875 pages=32    {e,w} outer, hash_join with p inner  cost=194
 {e,w,p}  rows=1875 pages=32    {e,w} outer, sort_merge_join with p inner  cost=215
-{e,w,p}  rows=1875 pages=32  * {w,p} outer, nested_loop_join with e inner  cost=130
+{e,w,p}  rows=1875 pages=32    {w,p} outer, nested_loop_join with e inner  cost=184
 {e,w,p}  rows=1875 pages=32    {w,p} outer, hash_join with e inner  cost=256
 {e,w,p}  rows=1875 pages=32    {w,p} outer, sort_merge_join with e inner  cost=291
 {e,w,d}  no join predicate connects it, skipped
 {e,p,d}  no join predicate connects it, skipped
-{w,p,d}  rows=375 pages=5    {w,p} outer, nested_loop_join with d inner  cost=77
+{w,p,d}  rows=375 pages=5    {w,p} outer, nested_loop_join with d inner  cost=78
 {w,p,d}  rows=375 pages=5    {w,p} outer, hash_join with d inner  cost=107
 {w,p,d}  rows=375 pages=5    {w,p} outer, sort_merge_join with d inner  cost=92
 {w,p,d}  rows=375 pages=5  * {p,d} outer, nested_loop_join with w inner  cost=65
 {w,p,d}  rows=375 pages=5    {p,d} outer, hash_join with w inner  cost=81
 {w,p,d}  rows=375 pages=5    {p,d} outer, sort_merge_join with w inner  cost=73
-{e,w,p,d}  rows=375 pages=9    {e,w,p} outer, nested_loop_join with d inner  cost=165
-{e,w,p,d}  rows=375 pages=9    {e,w,p} outer, hash_join with d inner  cost=229
-{e,w,p,d}  rows=375 pages=9    {e,w,p} outer, sort_merge_join with d inner  cost=260
+{e,w,p,d}  rows=375 pages=9    {e,w,p} outer, nested_loop_join with d inner  cost=178
+{e,w,p,d}  rows=375 pages=9    {e,w,p} outer, hash_join with d inner  cost=242
+{e,w,p,d}  rows=375 pages=9    {e,w,p} outer, sort_merge_join with d inner  cost=273
 {e,w,p,d}  rows=375 pages=9  * {w,p,d} outer, nested_loop_join with e inner  cost=124
 {e,w,p,d}  rows=375 pages=9    {w,p,d} outer, hash_join with e inner  cost=232
 {e,w,p,d}  rows=375 pages=9    {w,p,d} outer, sort_merge_join with e inner  cost=276
 ```
 
-The winner is ((Dept ⋈ Proj) ⋈ Works) ⋈ Emp: start from the 10 Ottawa departments, the smallest input,
-and join the largest table last, when 375 rows are left. Five of the eleven subsets are skipped, because
+The winner is ((Proj ⋈ Dept) ⋈ Works) ⋈ Emp: join Proj to the 10 Ottawa departments, the smallest
+input, first (Proj as the outer; the other order also costs 4, and a tie keeps the written order), and
+join the largest table last, when 375 rows are left. Five of the eleven subsets are skipped, because
 no predicate connects them (Emp joins only Works, and Dept only Proj). The final plan's explain total is
 120 rather than the DP's 124, because rule 6 then pushes projections into the inputs and shrinks the
 pages. Its measured I/O was 127. The model's 120 is the 117 data pages of the four tables plus 3 pages

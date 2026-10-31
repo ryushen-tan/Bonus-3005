@@ -28,8 +28,11 @@ inline Json jsonBool(bool b) { Json j; j.kind = Json::Bool; j.text = b ? "true" 
 inline Json jsonArray() { Json j; j.kind = Json::Array; return j; }
 inline Json jsonObject() { Json j; j.kind = Json::Object; return j; }
 
+// the parser recurses once per array or object, so a document nested deeper than any plan is an error
+// rather than a stack overflow
+constexpr int MAX_JSON_DEPTH = 1000;
 struct JsonParser {
-    const std::string& s; size_t i = 0; int line = 1; size_t lineStart = 0;
+    const std::string& s; size_t i = 0; int line = 1, depth = 0; size_t lineStart = 0;
     int col() const { return int(i - lineStart) + 1; }
     [[noreturn]] void fail(const std::string& what) {
         std::string found = i >= s.size() ? "end of input" : "'" + std::string(1, s[i]) + "'";
@@ -49,9 +52,11 @@ struct JsonParser {
         j.line = line; j.col = col();
         if (i >= s.size()) fail("a value");
         char c = s[i];
+        if ((c == '{' || c == '[') && ++depth > MAX_JSON_DEPTH)
+            throw Error{"json syntax error: arrays and objects nested more than " + std::to_string(MAX_JSON_DEPTH) + " deep", line, col()};
         if (c == '{') {
             j.kind = Json::Object; i++;
-            if (accept('}')) return j;
+            if (accept('}')) { depth--; return j; }
             do {
                 space();
                 if (i >= s.size() || s[i] != '"') fail("a string key");
@@ -60,12 +65,14 @@ struct JsonParser {
                 j.fields.emplace_back(key, value());
             } while (accept(','));
             if (!accept('}')) fail("',' or '}'");
+            depth--;
         }
         else if (c == '[') {
             j.kind = Json::Array; i++;
-            if (accept(']')) return j;
+            if (accept(']')) { depth--; return j; }
             do j.items.push_back(value()); while (accept(','));
             if (!accept(']')) fail("',' or ']'");
+            depth--;
         }
         else if (c == '"') { j.kind = Json::String; j.text = string(); }
         else if (c == '-' || dig(c)) { j.kind = Json::Number; j.text = number(); }

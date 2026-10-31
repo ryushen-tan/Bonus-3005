@@ -6,9 +6,12 @@ tables into `perf/m1/results.md`. It takes under a second. It was run twice, and
 identical numbers.
 
 The five traces the handout publishes were not on Brightspace when I did this, so `perf/m1.py` writes
-five of its own with a fixed linear congruential generator. Trace 3 is the one the handout describes, a
-sequential scan of an 80 page file repeated ten times. The traces are in `perf/m1/traces/`, and
-`storage trace` runs any trace file, so the published ones can be dropped in.
+five of its own with a fixed linear congruential generator, the example `rand` of the C standard. Like
+that example it keeps only the high 15 bits of each value: the low bits of a generator modulo a power of
+two repeat with short periods, and the lowest one alternates, so with two draws per access the second
+would always be even. Trace 3 is the one the handout describes, a sequential scan of an 80 page file
+repeated ten times. The traces are in `perf/m1/traces/`, and `storage trace` runs any trace file, so the
+published ones can be dropped in.
 
 ## 1 Capacity
 
@@ -42,14 +45,14 @@ unpinned clean straight after it is fetched. Hit rate is hits divided by accesse
 
 | trace | accesses | distinct pages | B | LRU hits | LRU hit rate | CLOCK hits | CLOCK hit rate |
 |---|---|---|---|---|---|---|---|
-| 1 uniform over 200 pages | 1000 | 199 | 4 | 0 | 0.000 | 0 | 0.000 |
-| 1 uniform over 200 pages | 1000 | 199 | 16 | 81 | 0.081 | 80 | 0.080 |
-| 1 uniform over 200 pages | 1000 | 199 | 64 | 302 | 0.302 | 296 | 0.296 |
-| 1 uniform over 200 pages | 1000 | 199 | 256 | 801 | 0.801 | 801 | 0.801 |
-| 2 80/20 skew over 200 pages | 1000 | 94 | 4 | 118 | 0.118 | 103 | 0.103 |
-| 2 80/20 skew over 200 pages | 1000 | 94 | 16 | 455 | 0.455 | 440 | 0.440 |
-| 2 80/20 skew over 200 pages | 1000 | 94 | 64 | 862 | 0.862 | 857 | 0.857 |
-| 2 80/20 skew over 200 pages | 1000 | 94 | 256 | 906 | 0.906 | 906 | 0.906 |
+| 1 uniform over 200 pages | 1000 | 198 | 4 | 20 | 0.020 | 21 | 0.021 |
+| 1 uniform over 200 pages | 1000 | 198 | 16 | 73 | 0.073 | 71 | 0.071 |
+| 1 uniform over 200 pages | 1000 | 198 | 64 | 297 | 0.297 | 296 | 0.296 |
+| 1 uniform over 200 pages | 1000 | 198 | 256 | 802 | 0.802 | 802 | 0.802 |
+| 2 80/20 skew over 200 pages | 1000 | 158 | 4 | 50 | 0.050 | 49 | 0.049 |
+| 2 80/20 skew over 200 pages | 1000 | 158 | 16 | 243 | 0.243 | 234 | 0.234 |
+| 2 80/20 skew over 200 pages | 1000 | 158 | 64 | 745 | 0.745 | 715 | 0.715 |
+| 2 80/20 skew over 200 pages | 1000 | 158 | 256 | 842 | 0.842 | 842 | 0.842 |
 | 3 sequential scan of 80 pages, ten times | 800 | 80 | 4 | 0 | 0.000 | 0 | 0.000 |
 | 3 sequential scan of 80 pages, ten times | 800 | 80 | 16 | 0 | 0.000 | 0 | 0.000 |
 | 3 sequential scan of 80 pages, ten times | 800 | 80 | 64 | 0 | 0.000 | 0 | 0.000 |
@@ -63,9 +66,11 @@ unpinned clean straight after it is fetched. Hit rate is hits divided by accesse
 | 5 nested loop: 20 outer pages, 40 page inner scan | 820 | 60 | 64 | 760 | 0.927 | 760 | 0.927 |
 | 5 nested loop: 20 outer pages, 40 page inner scan | 820 | 60 | 256 | 760 | 0.927 | 760 | 0.927 |
 
-The upper bound for any policy is 1 − distinct / accesses, because each distinct page misses once. The
-pool reaches that bound in every row where B is at least the number of distinct pages: 801, 906, 720,
-290 and 760 hits.
+The upper bound for any policy is 1 − distinct / accesses, because each distinct page misses once. Both
+policies reach that bound in every row where B is at least the number of distinct pages: 802, 842 and 720
+hits on traces 1 to 3 at B = 256, and 760 on trace 5 at B = 64 and 256. Trace 4 has 310 distinct pages,
+more than any B here, but only its ten hot pages are ever asked for twice, so its bound of 290 hits needs
+only the hot set kept. LRU keeps it from B = 64 on and reaches 290; CLOCK gets 279 and 283.
 
 **Trace 3 under LRU at B = 64: zero hits out of 800.** This is sequential flooding. The scan touches 80
 pages in a cycle, and LRU always evicts the page whose next use is furthest away, because in a cycle
@@ -79,19 +84,22 @@ Trace 4 shows the cost to other work: ten hot pages would fit easily in 16 frame
 only every twentieth access, and the 300 page scan pushes nineteen other pages through between two
 touches, so at B = 16 not one of the hot accesses hits.
 
-**Which I would ship: CLOCK.** On the four traces that are not pure scans, CLOCK is within 0.018 of LRU's
-hit rate everywhere, and on trace 3 they are equally bad. CLOCK costs a reference bit and a hand, with
-no ordering to keep on every hit. My LRU searches all B stamps on each miss, and a real one would need a
-list update under a latch on every hit. Sequential flooding is not something either policy fixes, so I
-would fix it outside the policy. A query that knows it is scanning a table larger than the pool should
-read through a small ring of frames of its own, which is what PostgreSQL does for large sequential
-scans, or use LRU-K (O'Neil et al.), which can tell a page referenced once by a scan from one referenced
-repeatedly.
+**Which I would ship: CLOCK**, and it is the policy the tools use when `--policy` is not given. On the
+four traces that are not pure scans, CLOCK is within 0.030 of LRU's hit rate everywhere, the widest gap
+being trace 2 at B = 64 (0.715 against 0.745), and on trace 3 they are equally bad. CLOCK costs a
+reference bit and a hand, with no ordering to keep on every hit. My LRU searches all B stamps on each
+miss, and a real one would need a list update under a latch on every hit. Sequential flooding is not
+something either policy fixes, so I would fix it outside the policy. A query that knows it is scanning a
+table larger than the pool should read through a small ring of frames of its own, which is what
+PostgreSQL does for large sequential scans, or use LRU-K (O'Neil et al.), which can tell a page
+referenced once by a scan from one referenced repeatedly.
 
 ## 3 Scan cost
 
 `Big(a INT, b VARCHAR(20), c INT)` loaded with 120000 rows of 13 bytes: 500 data pages at 240 per page,
 plus one directory page. Each scan is a fresh process: the pool starts empty after reading the catalog.
+The scans ran under the default policy, CLOCK; `--policy lru` gives the same counters at every B, because
+the scan never asks for a page twice.
 
 | B | hits | misses | evictions | reads | writes |
 |---|---|---|---|---|---|
@@ -103,8 +111,9 @@ Page reads are 501 at every B: the 500 data pages and the directory page, each r
 neither falls nor rises with B. It cannot fall, because nothing is cached between commands, and within
 a scan no page is asked for twice. It does not rise because the scan never needs a page back once it
 has unpinned it (section 4 of DESIGN_M1.md). Evictions are 501 − B: the first B misses fill empty
-frames, and every miss after that replaces a page. B = 2 works even though only one frame is ever in use,
-because the scan pins one page at a time.
+frames, and every miss after that replaces a page, so at B = 2 both frames hold pages. But only one of
+them is ever pinned, because the scan pins one page at a time, which is why B = 2 works, and B = 1 does
+too (501 reads and 500 evictions).
 
 ## 4 Sources
 

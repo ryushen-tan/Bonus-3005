@@ -7,17 +7,28 @@
 #include <functional>
 #include <map>
 
-// one entry per table reference in FROM, named by its alias or its table, with that name on every column
-struct ScopeEntry { std::string name; std::vector<Col> cols; };
+// one entry per table reference in FROM, named by its alias or its table, with that name on every column;
+// for a JOIN's ON condition the entries of the other comma separated items are marked outside
+struct ScopeEntry { std::string name; std::vector<Col> cols; bool outside = false; };
 struct Compiled { LogicalNode node; std::vector<Col> cols; };
 
 struct AggregateUse { std::string func, column, name; Col out; };
-// what an aggregating block groups by and computes, shared by its select list, HAVING and ORDER BY
-struct Grouping { std::vector<Col> keys; std::vector<AggregateUse> aggs; };
+// what an aggregating block groups by and computes, shared by its select list, HAVING and ORDER BY, with the
+// select list's aliases, which a default aggregate name must not take
+struct Grouping { std::vector<Col> keys; std::vector<AggregateUse> aggs; std::vector<std::string> aliases; };
+
+// a condition's tree is at most MAX_NESTING + 3 levels deep and MAX_COMPARISONS + MAX_NESTING + 3 tall
+static_assert(MAX_NESTING + 3 <= MAX_DEPTH && MAX_COMPARISONS + MAX_NESTING + 3 <= MAX_HEIGHT, "mk must accept every condition a statement may hold");
 
 [[noreturn]] inline void sqlFail(const std::string& category, const std::string& message, int line, int col) { throw SqlError{category, message, line, col}; }
 inline bool sameColumn(const Col& a, const Col& b) { return a.rel == b.rel && a.name == b.name; }
 inline LogicalNode unaryNode(const std::string& op, LogicalNode child) { return logicalNode(op, {std::move(child)}); }
+// name, or when that is taken the first of name_2, name_3, ... that is not
+inline std::string freeName(const std::string& name, const std::function<bool(const std::string&)>& taken) {
+    std::string candidate = name;
+    for (int n = 2; taken(candidate); n++) candidate = name + "_" + std::to_string(n);
+    return candidate;
+}
 
 struct SqlCompiler {
     std::function<const std::vector<Col>*(const std::string&)> tables;
@@ -33,13 +44,14 @@ struct SqlCompiler {
         if (!c.qualifier.empty()) {
             for (const ScopeEntry& e : scope) {
                 if (e.name != c.qualifier) continue;
+                if (e.outside) sqlFail("name", c.qualifier + " is not part of this JOIN, so its ON condition cannot use " + refText(c), c.line, c.col);
                 for (const Col& col : e.cols) if (col.name == c.name) return col;
                 sqlFail("name", "column " + c.name + " does not exist in " + c.qualifier, c.line, c.col);
             }
             sqlFail("name", "unknown table or alias " + c.qualifier + " in " + refText(c), c.line, c.col);
         }
         std::vector<Col> hits;
-        for (const ScopeEntry& e : scope) for (const Col& col : e.cols) if (col.name == c.name) hits.push_back(col);
+        for (const ScopeEntry& e : scope) if (!e.outside) for (const Col& col : e.cols) if (col.name == c.name) hits.push_back(col);
         if (hits.empty()) sqlFail("name", "unknown column " + c.name, c.line, c.col);
         if (hits.size() > 1) {
             std::string candidates;
@@ -49,34 +61,56 @@ struct SqlCompiler {
         return hits[0];
     }
 
-    // the aggregate's output column, reusing an identical one already computed unless it is named
+    // the aggregate's output column, reusing an identical one already computed unless it is named; a name
+    // another aggregate has, or a default name an alias has, gets a suffix
     size_t useAggregate(Grouping& g, const AggCall& a, const std::vector<ScopeEntry>& scope, const std::string& alias) {
         Col out{"", "", IntT};
         std::string column = "*";
         if (!a.star) {
             Col source = resolveColumn(a.column, scope);
             column = qualified(source);
-            if ((a.func == "sum" || a.func == "avg") && source.type != IntT)
-                sqlFail("type", upper(a.func) + " needs an INT column, " + column + " is " + typeName(source), a.line, a.col);
-            if (a.func == "sum") out.type = BigT;
+            if ((a.func == "sum" || a.func == "avg") && source.type == StrT)
+                sqlFail("type", upper(a.func) + " needs a number, " + column + " is " + typeName(source), a.line, a.col);
+            if (a.func == "sum") out.type = source.type == RealT ? RealT : BigT;
             else if (a.func == "avg") out.type = RealT;
             else if (a.func != "count") { out.type = source.type; out.length = source.length; }
         }
         if (alias.empty())
             for (size_t i = 0; i < g.aggs.size(); i++) if (g.aggs[i].func == a.func && g.aggs[i].column == column) return i;
-        out.name = alias.empty() ? aggregateName(a.func, column) : alias;
-        for (const AggregateUse& u : g.aggs) if (u.name == out.name) sqlFail("schema", "two aggregates are both named " + out.name, a.line, a.col);
+        out.name = freeName(alias.empty() ? aggregateName(a.func, column) : alias, [&](const std::string& name) {
+            return std::any_of(g.aggs.begin(), g.aggs.end(), [&](const AggregateUse& u) { return u.name == name; }) ||
+                   (alias.empty() && std::count(g.aliases.begin(), g.aliases.end(), name) > 0);
+        });
         g.aggs.push_back({a.func, column, out.name, out});
         return g.aggs.size() - 1;
     }
+    // a GROUP BY name is a FROM column first and otherwise, as in PostgreSQL, the column a select list alias names
+    Col groupKey(const ColumnRef& ref, const std::vector<SelectItem>& items, const std::vector<ScopeEntry>& scope) {
+        bool fromColumn = std::any_of(scope.begin(), scope.end(), [&](const ScopeEntry& e) {
+            return std::any_of(e.cols.begin(), e.cols.end(), [&](const Col& c) { return c.name == ref.name; });
+        });
+        if (!ref.qualifier.empty() || fromColumn) return resolveColumn(ref, scope);
+        for (const SelectItem& item : items) {
+            if (item.alias != ref.name) continue;
+            if (item.isAgg) sqlFail("aggregate", "GROUP BY " + ref.name + " names " + aggText(item.agg) + ", and aggregate functions are not allowed in GROUP BY", ref.line, ref.col);
+            return resolveColumn(item.column, scope);
+        }
+        return resolveColumn(ref, scope);
+    }
     bool isKey(const Grouping& g, const Col& c) { return std::any_of(g.keys.begin(), g.keys.end(), [&](const Col& k) { return sameColumn(k, c); }); }
+
+    // every integer is an INT, which is 4 bytes here
+    static void checkInt(const SqlOperand& o) {
+        if (o.literal.size() > 11 || std::stoll(o.literal) < INT32_MIN || std::stoll(o.literal) > INT32_MAX)
+            sqlFail("type", o.literal + " does not fit in an INT, which has 4 bytes and holds -2147483648 to 2147483647", o.line, o.col);
+    }
 
     // a condition as a Bonus 1 condition tree, which the executor parses back from its text; in HAVING the
     // aggregates become the names of the group_by's output columns
     std::pair<Node, Col> operandNode(const SqlOperand& o, const std::vector<ScopeEntry>& scope, Grouping* having, const std::string& clause) {
         switch (o.kind) {
             case SqlOperand::Int:
-                if (o.literal.size() > 11 || std::stoll(o.literal) < INT32_MIN || std::stoll(o.literal) > INT32_MAX) sqlFail("type", o.literal + " does not fit in an INT", o.line, o.col);
+                checkInt(o);
                 return {mk(NumLit, Token{Num, o.literal, o.line, o.col}), Col{"", o.literal, IntT}};
             case SqlOperand::Str: return {mk(StrLit, Token{Str, o.literal, o.line, o.col}), Col{"", quoted(o.literal), StrT, int(o.literal.size())}};
             case SqlOperand::Column: {
@@ -94,8 +128,9 @@ struct SqlCompiler {
     Node conditionNode(const Condition& c, const std::vector<ScopeEntry>& scope, Grouping* having, const std::string& clause) {
         Token t{Word, "", c.line, c.col};
         if (c.kind == Condition::Or || c.kind == Condition::And) {
-            Node l = conditionNode(c.kids[0], scope, having, clause), r = conditionNode(c.kids[1], scope, having, clause);
-            return mk(c.kind == Condition::Or ? Or : And, t, std::move(l), std::move(r));
+            Node chain = conditionNode(c.kids[0], scope, having, clause);
+            for (size_t k = 1; k < c.kids.size(); k++) chain = mk(c.kind == Condition::Or ? Or : And, t, std::move(chain), conditionNode(c.kids[k], scope, having, clause));
+            return chain;
         }
         if (c.kind == Condition::Not) return mk(Not, t, conditionNode(c.kids[0], scope, having, clause));
         auto [l, lt] = operandNode(c.left, scope, having, clause);
@@ -113,13 +148,20 @@ struct SqlCompiler {
         ScopeEntry entry{name, {}};
         LogicalNode node;
         if (r.sub) {
+            // the alias requalifies every column, so a column with an earlier one's name is renamed name_2, name_3, ...
             Compiled c = query(*r.sub);
+            std::vector<std::pair<std::string, std::string>> columns;
             for (const Col& col : c.cols) {
-                for (const Col& seen : entry.cols)
-                    if (seen.name == col.name) sqlFail("schema", "subquery " + name + " has two columns named " + col.name + ", give one of them an alias", r.line, r.col);
-                entry.cols.push_back({name, col.name, col.type, col.length});
+                std::string unique = freeName(col.name, [&](const std::string& n) {
+                    return std::any_of(entry.cols.begin(), entry.cols.end(), [&](const Col& seen) { return seen.name == n; });
+                });
+                columns.emplace_back(qualified(col), unique == col.name ? "" : unique);
+                entry.cols.push_back({name, unique, col.type, col.length});
             }
-            node = unaryNode("rename", std::move(c.node));
+            node = std::move(c.node);
+            bool renamed = std::any_of(columns.begin(), columns.end(), [](const auto& column) { return !column.second.empty(); });
+            if (renamed) { node = unaryNode("project", std::move(node)); node.columns = columns; }
+            node = unaryNode("rename", std::move(node));
             node.to = name;
         } else {
             const std::vector<Col>* cols = schemaOf(r.table);
@@ -134,16 +176,20 @@ struct SqlCompiler {
     }
 
     Compiled block(const SelectBlock& b, const std::vector<OrderItem>& orderBy, long long limit) {
-        // 1 FROM: each JOIN chain left to right, the chains combined by cross products
+        // 1 FROM: each JOIN chain left to right, the chains combined by cross products; JOIN binds tighter than
+        // the comma, so an ON condition sees only the tables of its own chain, as in PostgreSQL
         std::vector<ScopeEntry> scope;
         LogicalNode node;
         for (size_t ci = 0; ci < b.from.size(); ci++) {
             const JoinChain& chain = b.from[ci];
+            size_t chainStart = scope.size();
             LogicalNode joined = tableNode(chain.refs[0], scope);
             for (size_t k = 1; k < chain.refs.size(); k++) {
                 LogicalNode right = tableNode(chain.refs[k], scope);
+                std::vector<ScopeEntry> onScope = scope;
+                for (size_t e = 0; e < chainStart; e++) onScope[e].outside = true;
                 LogicalNode j = logicalNode("join", {std::move(joined), std::move(right)});
-                j.condition = condText(conditionNode(chain.on[k - 1], scope, nullptr, "JOIN ... ON"));
+                j.condition = condText(conditionNode(chain.on[k - 1], onScope, nullptr, "JOIN ... ON"));
                 joined = std::move(j);
             }
             node = ci == 0 ? std::move(joined) : logicalNode("cross", {std::move(node), std::move(joined)});
@@ -160,7 +206,11 @@ struct SqlCompiler {
         Grouping g;
         std::vector<size_t> itemAggregate(b.items.size()), orderAggregate(orderBy.size());
         if (aggregating) {
-            for (const ColumnRef& ref : b.groupBy) g.keys.push_back(resolveColumn(ref, scope));
+            for (const SelectItem& item : b.items) if (!item.alias.empty()) g.aliases.push_back(item.alias);
+            for (const ColumnRef& ref : b.groupBy) {
+                Col key = groupKey(ref, b.items, scope);
+                if (!isKey(g, key)) g.keys.push_back(key);
+            }
             for (size_t i = 0; i < b.items.size(); i++) if (b.items[i].isAgg) itemAggregate[i] = useAggregate(g, b.items[i].agg, scope, b.items[i].alias);
             std::string having;
             if (b.having) having = condText(conditionNode(*b.having, scope, &g, "HAVING"));
@@ -170,53 +220,60 @@ struct SqlCompiler {
             for (const AggregateUse& u : g.aggs) node.aggregates.push_back({u.func, u.column, u.name});
             if (b.having) { node = unaryNode("select", std::move(node)); node.condition = having; }
         }
-        // 5 SELECT: the projection, then distinct if it was asked for and can change anything
+        // 5 SELECT: the projection, then distinct if it was asked for and can change anything; a column with an
+        // earlier one's qualified name is renamed name_2, name_3, ...
         std::vector<std::pair<std::string, std::string>> columns;
         std::vector<Col> out;
-        auto addColumn = [&](const Col& c, const std::string& alias, int line, int col) {
-            if (aggregating && !isKey(g, c)) sqlFail("aggregate", "column " + qualified(c) + " must appear in GROUP BY or be used in an aggregate function", line, col);
-            Col shown = alias.empty() ? c : Col{"", alias, c.type, c.length};
-            for (const Col& o : out) if (sameColumn(o, shown)) sqlFail("schema", "the select list has " + qualified(shown) + " twice", line, col);
-            columns.emplace_back(qualified(c), alias);
+        // each output column's name as the query wrote it, which is what ORDER BY matches
+        std::vector<std::string> written;
+        auto addColumn = [&](const std::string& source, Col shown, const std::string& name) {
+            auto taken = [&](const std::string& n) { return std::any_of(out.begin(), out.end(), [&](const Col& o) { return qualified(o) == n; }); };
+            if (taken(qualified(shown))) shown = Col{"", freeName(shown.name, [&](const std::string& n) { return n == shown.name || taken(n); }), shown.type, shown.length};
+            columns.emplace_back(source, qualified(shown) == source ? "" : shown.name);
             out.push_back(shown);
+            written.push_back(name);
         };
-        if (b.star) for (const ScopeEntry& e : scope) for (const Col& c : e.cols) addColumn(c, "", b.line, b.col);
+        auto addSelected = [&](const Col& c, const std::string& alias, int line, int col) {
+            if (aggregating && !isKey(g, c)) sqlFail("aggregate", "column " + qualified(c) + " must appear in GROUP BY or be used in an aggregate function", line, col);
+            addColumn(qualified(c), alias.empty() ? c : Col{"", alias, c.type, c.length}, alias.empty() ? c.name : alias);
+        };
+        if (b.star) for (const ScopeEntry& e : scope) for (const Col& c : e.cols) addSelected(c, "", b.line, b.col);
         for (size_t i = 0; i < b.items.size(); i++) {
             const SelectItem& item = b.items[i];
-            if (!item.isAgg) { addColumn(resolveColumn(item.column, scope), item.alias, item.line, item.col); continue; }
+            if (!item.isAgg) { addSelected(resolveColumn(item.column, scope), item.alias, item.line, item.col); continue; }
             const AggregateUse& u = g.aggs[itemAggregate[i]];
-            for (const Col& o : out) if (sameColumn(o, u.out)) sqlFail("schema", "the select list has " + u.name + " twice", item.line, item.col);
-            columns.emplace_back(u.name, "");
-            out.push_back(u.out);
+            addColumn(u.name, u.out, u.name);
         }
         size_t visible = columns.size();
         bool allKeysShown = std::all_of(g.keys.begin(), g.keys.end(), [&](const Col& k) { return std::any_of(out.begin(), out.end(), [&](const Col& o) { return sameColumn(o, k); }); });
         bool distinct = b.distinct && !(aggregating && allKeysShown);
-        // 6 ORDER BY: output names first, then the FROM scope; a column the select list dropped is carried
-        // through the projection and dropped after the sort
+        // 6 ORDER BY: a name alone is first the name of an output column, two of them with different sources
+        // being ambiguous, and otherwise a FROM column; a key the select list does not show is carried through
+        // the projection and dropped after the sort
         std::vector<std::pair<std::string, bool>> keys;
         for (size_t i = 0; i < orderBy.size(); i++) {
             const OrderItem& o = orderBy[i];
-            std::string key;
-            if (o.isAgg) {
-                const AggregateUse& u = g.aggs[orderAggregate[i]];
-                key = u.name;
-                bool shown = std::any_of(out.begin(), out.end(), [&](const Col& c) { return sameColumn(c, u.out); });
-                if (!shown && b.distinct) sqlFail("name", "with SELECT DISTINCT, ORDER BY " + aggText(o.agg) + " must be in the select list", o.agg.line, o.agg.col);
-                if (!shown && std::none_of(columns.begin(), columns.end(), [&](const auto& c) { return c.first == key && c.second.empty(); })) columns.emplace_back(key, "");
-            } else {
-                for (size_t k = 0; k < b.items.size() && key.empty() && o.column.qualifier.empty(); k++)
-                    if (!b.items[k].alias.empty() && b.items[k].alias == o.column.name) key = o.column.name;
-                if (key.empty()) {
-                    Col c = resolveColumn(o.column, scope);
-                    if (aggregating && !isKey(g, c)) sqlFail("aggregate", "column " + qualified(c) + " must appear in GROUP BY or be used in an aggregate function", o.column.line, o.column.col);
-                    key = qualified(c);
-                    bool shown = std::any_of(out.begin(), out.end(), [&](const Col& x) { return sameColumn(x, c); });
-                    if (!shown && b.distinct) sqlFail("name", "with SELECT DISTINCT, ORDER BY " + refText(o.column) + " must be in the select list", o.column.line, o.column.col);
-                    if (!shown && std::none_of(columns.begin(), columns.end(), [&](const auto& x) { return x.first == key && x.second.empty(); })) columns.emplace_back(key, "");
-                }
+            size_t named = visible;
+            for (size_t k = 0; k < visible && !o.isAgg && o.column.qualifier.empty(); k++) {
+                if (written[k] != o.column.name) continue;
+                if (named < visible && columns[named].first != columns[k].first)
+                    sqlFail("ambiguity", "ORDER BY " + o.column.name + " is ambiguous, two columns of the select list are named " + o.column.name, o.line, o.col);
+                if (named == visible) named = k;
             }
-            keys.emplace_back(key, o.desc);
+            if (named < visible) { keys.emplace_back(qualified(out[named]), o.desc); continue; }
+            std::string source;
+            if (o.isAgg) source = g.aggs[orderAggregate[i]].name;
+            else {
+                Col c = resolveColumn(o.column, scope);
+                if (aggregating && !isKey(g, c)) sqlFail("aggregate", "column " + qualified(c) + " must appear in GROUP BY or be used in an aggregate function", o.line, o.col);
+                source = qualified(c);
+            }
+            size_t shown = 0;
+            while (shown < visible && columns[shown].first != source) shown++;
+            if (shown < visible) { keys.emplace_back(qualified(out[shown]), o.desc); continue; }
+            if (b.distinct) sqlFail("name", "with SELECT DISTINCT, ORDER BY " + (o.isAgg ? aggText(o.agg) : refText(o.column)) + " must be in the select list", o.line, o.col);
+            if (std::none_of(columns.begin(), columns.end(), [&](const auto& c) { return c.first == source; })) columns.emplace_back(source, "");
+            keys.emplace_back(source, o.desc);
         }
         node = unaryNode("project", std::move(node));
         node.columns = columns;
@@ -254,11 +311,11 @@ struct SqlCompiler {
         if (!q.orderBy.empty()) {
             LogicalNode s = unaryNode("sort", std::move(acc.node));
             for (const OrderItem& o : q.orderBy) {
-                if (o.isAgg) sqlFail("name", "ORDER BY after a set operation can only name the result's columns", o.agg.line, o.agg.col);
+                if (o.isAgg || !o.column.qualifier.empty()) sqlFail("name", "ORDER BY after a set operation can only name the result's columns", o.line, o.col);
                 std::vector<const Col*> hits;
-                for (const Col& c : acc.cols) if (c.name == o.column.name && (o.column.qualifier.empty() || c.rel == o.column.qualifier)) hits.push_back(&c);
-                if (hits.empty()) sqlFail("name", "ORDER BY " + refText(o.column) + " is not a column of the result", o.column.line, o.column.col);
-                if (hits.size() > 1) sqlFail("ambiguity", "ORDER BY " + refText(o.column) + " could be " + qualified(*hits[0]) + " or " + qualified(*hits[1]), o.column.line, o.column.col);
+                for (const Col& c : acc.cols) if (c.name == o.column.name) hits.push_back(&c);
+                if (hits.empty()) sqlFail("name", "ORDER BY " + o.column.name + " is not a column of the result", o.line, o.col);
+                if (hits.size() > 1) sqlFail("ambiguity", "ORDER BY " + o.column.name + " could be " + qualified(*hits[0]) + " or " + qualified(*hits[1]), o.line, o.col);
                 s.sortKeys.emplace_back(qualified(*hits[0]), o.desc);
             }
             acc.node = std::move(s);
@@ -270,7 +327,7 @@ struct SqlCompiler {
     // a CREATE TABLE or INSERT is checked here, and later statements of the same script see the new table
     Value insertValue(const SqlOperand& v, const Col& c) {
         if (v.kind == SqlOperand::Int && c.type == IntT) {
-            if (v.literal.size() > 11 || std::stoll(v.literal) < INT32_MIN || std::stoll(v.literal) > INT32_MAX) sqlFail("type", v.literal + " does not fit in an INT", v.line, v.col);
+            checkInt(v);
             return {true, double(std::stoll(v.literal)), std::to_string(std::stoll(v.literal))};
         }
         if (v.kind == SqlOperand::Str && c.type == StrT) {

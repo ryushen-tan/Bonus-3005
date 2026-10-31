@@ -24,6 +24,8 @@ const std::map<std::string, std::vector<std::string>> PLAN_FIELDS = {
     {"union_all", {"left", "right"}}, {"union", {"left", "right"}}, {"intersect", {"left", "right"}}, {"except", {"left", "right"}},
 };
 
+inline bool isInput(const std::string& field) { return field == "child" || field == "left" || field == "right"; }
+
 // every problem with the shape of the plan is found here, before any table is looked at
 inline void validatePlan(const Json& j, const std::string& path) {
     if (j.kind != Json::Object) planError(j, path, "must be an object, not " + kindName(j));
@@ -38,7 +40,10 @@ inline void validatePlan(const Json& j, const std::string& path) {
         const Json& value = member.second;
         auto must = [&](bool ok, const std::string& what) { if (!ok) planError(j, path, "field '" + field + "' must be " + what); };
         if (field == "table" || field == "to" || field == "condition") must(value.kind == Json::String && !value.text.empty(), "a non-empty string");
-        else if (field == "child" || field == "left" || field == "right") validatePlan(value, path + "." + field);
+        else if (isInput(field)) {
+            if (std::find(rule->second.begin(), rule->second.end(), field) == rule->second.end()) planError(j, path, "unexpected field '" + field + "'");
+            validatePlan(value, path + "." + field);
+        }
         else if (field == "mode") must(value.kind == Json::String && (value.text == "sort" || value.text == "hash"), "\"sort\" or \"hash\"");
         else if (field == "n") must(isWholeNumber(value), "a non-negative integer");
         else if (field == "columns")
@@ -85,9 +90,9 @@ inline void leaveFrameForParent(Operator& op) {
     if (op.holdsMemory()) { op.parentFrames = 1; return; }
     for (auto& c : op.children) leaveFrameForParent(*c);
 }
-inline bool holdsMemoryBelow(const Operator& op) {
-    if (op.holdsMemory()) return true;
-    for (const auto& c : op.children) if (holdsMemoryBelow(*c)) return true;
+inline bool writtenBelow(const Operator& op) {
+    if (op.writtenForParent()) return true;
+    for (const auto& c : op.children) if (writtenBelow(*c)) return true;
     return false;
 }
 
@@ -95,7 +100,7 @@ inline std::unique_ptr<Operator> buildNode(Database& db, const Json& j, const st
     const std::string& op = j.find("op")->text;
     auto text = [&](const char* field) -> const std::string& { return j.find(field)->text; };
     std::vector<std::unique_ptr<Operator>> kids;
-    for (const char* field : {"child", "left", "right"}) if (j.find(field)) kids.push_back(buildNode(db, *j.find(field), path + "." + field));
+    for (const std::string& field : PLAN_FIELDS.at(op)) if (isInput(field)) kids.push_back(buildNode(db, *j.find(field), path + "." + field));
     std::unique_ptr<Operator> node;
     try {
         if (op == "seqscan") {
@@ -128,7 +133,10 @@ inline std::unique_ptr<Operator> buildNode(Database& db, const Json& j, const st
             for (Col& c : node->schema) c.rel = text("to");
             checkUnique(node->schema, 0, 0, "rename");
         }
-        else if (op == "limit") node = std::make_unique<Limit>(db, std::stoll(text("n").size() > 18 ? "999999999999999999" : text("n")));
+        else if (op == "limit") {
+            node = std::make_unique<Limit>(db, std::stoll(text("n").size() > 18 ? "999999999999999999" : text("n")));
+            node->schema = kids[0]->schema;
+        }
         else if (op == "sort") {
             auto s = std::make_unique<Sort>(db);
             for (const Json& k : j.find("keys")->items) { Node a = attrNode(k.items[0].text); s->keys.push_back({resolve(kids[0]->schema, a), k.items[1].text == "desc"}); }
@@ -153,9 +161,10 @@ inline std::unique_ptr<Operator> buildNode(Database& db, const Json& j, const st
                     Node c = attrNode(a.items[1].text);
                     const Col& source = in[resolve(in, c)];
                     agg.column = (long long)c.idx;
-                    if ((func == "sum" || func == "avg") && source.type != IntT && source.type != BigT)
-                        throw Error{"type error: " + func + " needs an INT column, " + a.items[1].text + " is " + typeName(source)};
-                    if (func == "sum") col.type = BigT;
+                    if ((func == "sum" || func == "avg") && source.type == StrT)
+                        throw Error{"type error: " + func + " needs a number, " + a.items[1].text + " is " + typeName(source)};
+                    agg.real = source.type == RealT;
+                    if (func == "sum") col.type = agg.real ? RealT : BigT;
                     else if (func == "avg") col.type = RealT;
                     else if (func != "count") { col.type = source.type; col.length = source.length; }
                 }
@@ -203,7 +212,7 @@ inline std::unique_ptr<Operator> buildNode(Database& db, const Json& j, const st
     node->materialize.assign(node->children.size(), false);
     if (node->holdsMemory())
         for (size_t i = 0; i < node->children.size(); i++)
-            if ((node->materialize[i] = holdsMemoryBelow(*node->children[i]))) leaveFrameForParent(*node->children[i]);
+            if ((node->materialize[i] = writtenBelow(*node->children[i]))) leaveFrameForParent(*node->children[i]);
     return node;
 }
 inline std::unique_ptr<Operator> buildPlan(Database& db, const Json& plan) {
@@ -233,20 +242,10 @@ inline Counters totals(const Operator& op) {
     return c;
 }
 inline std::string label(const Operator& op) { return op.detail.empty() ? op.op : op.op + " " + op.detail; }
-inline void traceLines(const Operator& op, int depth, std::vector<std::pair<std::string, const Operator*>>& lines) {
-    lines.emplace_back(std::string(size_t(2 * depth), ' ') + label(op), &op);
-    for (const auto& kid : op.children) traceLines(*kid, depth + 1, lines);
-}
-inline void printTrace(const Operator& root, std::ostream& out) {
-    std::vector<std::pair<std::string, const Operator*>> lines;
-    traceLines(root, 0, lines);
-    size_t width = 0;
-    for (const auto& l : lines) width = std::max(width, l.first.size());
-    auto field = [](const std::string& name, unsigned long long v, size_t w) { std::string s = name + "=" + std::to_string(v); return s + std::string(s.size() < w ? w - s.size() : 1, ' '); };
-    for (const auto& [text, op] : lines) {
-        out << text << std::string(width + 2 - text.size(), ' ') << field("tuples_out", op->counters.tuplesOut, 20) << field("comparisons", op->counters.comparisons, 24)
-            << field("reads", op->counters.io.reads, 14) << field("writes", op->counters.io.writes, 14) << op->notes << '\n';
-    }
+inline void printTrace(const Operator& op, std::ostream& out, int depth = 0) {
+    out << std::string(size_t(2 * depth), ' ') << label(op) << " tuples_out=" << op.counters.tuplesOut << " comparisons=" << op.counters.comparisons
+        << " reads=" << op.counters.io.reads << " writes=" << op.counters.io.writes << (op.notes.empty() ? "" : " " + op.notes) << '\n';
+    for (const auto& kid : op.children) printTrace(*kid, out, depth + 1);
 }
 inline Json resultJson(const Result& r, const Operator& root) {
     Json rows = jsonArray();
@@ -258,8 +257,8 @@ inline Json resultJson(const Result& r, const Operator& root) {
 }
 
 inline int execTool(const std::vector<std::string>& args, std::ostream& out) {
-    const char* usage = "usage: exec run   --db DIR --plan plan.json [--frames B] [--policy lru|clock] [--json]\n"
-                        "       exec trace --db DIR --plan plan.json [--frames B] [--policy lru|clock]\n";
+    const char* usage = "usage: exec run   --db DIR --plan plan.json [--frames B] [--policy clock|lru] [--json]\n"
+                        "       exec trace --db DIR --plan plan.json [--frames B] [--policy clock|lru]\n";
     try {
         Args a = parseArgs(args, {"json"});
         if (a.command != "run" && a.command != "trace") { out << usage; return 2; }
@@ -267,14 +266,10 @@ inline int execTool(const std::vector<std::string>& args, std::ostream& out) {
         int frames = a.number("frames", 32);
         if (frames < 1) throw Error{"error: --frames must be at least 1"};
         Json plan = parseJson(readFile(a.need("plan")));
-        std::unique_ptr<Database> db = openDatabase(a.need("db"), frames, policyNamed(a.get("policy", "lru")));
+        std::unique_ptr<Database> db = openDatabase(a.need("db"), frames, policyNamed(a.get("policy", "clock")));
         std::unique_ptr<Operator> root = buildPlan(*db, plan);
         Result r = execute(*db, *root);
-        if (a.command == "trace") {
-            printTrace(*root, out);
-            Counters t = totals(*root);
-            out << "total: tuples_out=" << root->counters.tuplesOut << " comparisons=" << t.comparisons << " reads=" << t.io.reads << " writes=" << t.io.writes << " peak_frames=" << r.peakFrames << '\n';
-        }
+        if (a.command == "trace") printTrace(*root, out);
         else if (a.has("json")) out << dumpJson(resultJson(r, *root)) << '\n';
         else {
             for (size_t i = 0; i < r.schema.size(); i++) out << (i ? ", " : "") << qualified(r.schema[i]);
@@ -286,5 +281,7 @@ inline int execTool(const std::vector<std::string>& args, std::ostream& out) {
         return 0;
     } catch (const Error& e) {
         return report(e, out);
+    } catch (const std::exception& e) {
+        return report(Error{std::string("internal error: ") + e.what()}, out);
     }
 }

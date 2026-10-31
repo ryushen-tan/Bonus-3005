@@ -1,6 +1,7 @@
 // Module 2: worked examples, the checklist, and every operator checked against the Bonus 1 engine
 #include "../src/plan.hpp"
 #include "../src/treejson.hpp"
+#include <fstream>
 #include <functional>
 #include <sstream>
 
@@ -90,7 +91,7 @@ void setup() {
     };
     uint64_t seed = 7;
     auto rnd = [&](int n) { seed = seed * 6364136223846793005ULL + 1442695040888963407ULL; return int((seed >> 33) % uint64_t(n)); };
-    std::vector<std::string> r, s, t, skewL, skewR, sorted8, wide, pairs;
+    std::vector<std::string> r, s, t, skewL, skewR, sorted8, wide, pairs, ties, nameRows, left8, right8;
     const char* names[] = {"ann", "bob", "cy", "dee", "ed"};
     for (int i = 0; i < 3000; i++) r.push_back(std::to_string(i % 1500) + "," + std::to_string(rnd(40)) + "," + names[rnd(5)]);
     for (int i = 0; i < 1200; i++) s.push_back(std::to_string(rnd(50)) + ",c" + std::to_string(rnd(300)));
@@ -98,6 +99,15 @@ void setup() {
     for (int i = 0; i < 4000; i++) { skewL.push_back(std::to_string(i % 5 < 2 ? 7 : rnd(1000)) + "," + std::to_string(i)); skewR.push_back(std::to_string(i % 5 < 2 ? 7 : rnd(1000)) + ",x" + std::to_string(i)); }
     for (int i = 0; i < 1920; i++) sorted8.push_back(std::to_string(rnd(100000)) + ",bob," + std::to_string(i));
     for (int i = 0; i < 3000; i++) wide.push_back(std::to_string(rnd(1000)) + "," + std::string(150, char('a' + rnd(26))));
+    // averages of 1/32, -1/32 and -1/30000
+    for (int g = 0; g < 3; g++) {
+        ties.push_back(std::to_string(g) + (g == 0 ? ",1" : ",-1"));
+        for (int i = 0; i < (g == 2 ? 29999 : 31); i++) ties.push_back(std::to_string(g) + ",0");
+    }
+    for (int i = 0; i < 600; i++) nameRows.push_back(std::to_string(i % 120) + ",n" + std::to_string(i) + std::string(250, 'x') + "," + std::string(200, 'p'));
+    // joined, the five pairs are 4084 to 4088 bytes, and only the first fits on a page with its slot
+    for (int i = 0; i < 3; i++) { std::string row = std::to_string(i); for (int c = 0; c < 8; c++) row += "," + std::string(255, 'L'); left8.push_back(row); }
+    for (int i = 0; i < 5; i++) { std::string row = std::to_string(i); for (int c = 0; c < 7; c++) row += "," + std::string(255, 'R'); right8.push_back(row + "," + std::string(size_t(219 + i), 'r')); }
     table("R", "a:INT,b:INT,s:VARCHAR(10)", r);
     table("S", "b:INT,c:VARCHAR(12)", s);
     table("T", "b:INT,d:INT", t);
@@ -108,6 +118,12 @@ void setup() {
     table("Empty", "b:INT,x:VARCHAR(5)", {});
     table("R1", "b:INT", {"1", "2", "2", "3"});
     table("S1", "b:INT", {"2", "2", "4"});
+    table("Tie", "g:INT,v:INT", ties);
+    table("Names", "g:INT,name:VARCHAR(255),pad:VARCHAR(255)", nameRows);
+    std::string eight;
+    for (int i = 1; i <= 8; i++) eight += ",c" + std::to_string(i) + ":VARCHAR(255)";
+    table("L8", "id:INT" + eight, left8);
+    table("R8", "rid:INT" + eight, right8);
 }
 
 struct Test { const char* name; std::function<std::string()> run; };
@@ -288,6 +304,163 @@ const std::vector<Test> TESTS = {
         printTrace(*b.root, tb);
         return ta.str() == tb.str() && a.rows.size() == b.rows.size() ? "" : ta.str() + tb.str();
     }},
+    {"limit takes its child's schema, so distinct, project, a join and a union over a limit run", [] {
+        std::string limited = unary("limit", "\"n\":3", scan("R1")), got;
+        Outcome o = runPlan(limited, 4);
+        got += qualified(o.root->schema[0]) + " " + typeName(o.root->schema[0]) + " " + show(o.rows) + "\n";
+        for (const std::string& plan : {unary("distinct", "\"mode\":\"hash\"", limited), unary("distinct", "\"mode\":\"sort\"", limited), project("[\"R1.b\"]", limited),
+                                        join("hash_join", "R1.b = S1.b", limited, scan("S1")), binary("union", limited, unary("limit", "\"n\":1", scan("SkewL")))}) {
+            o = runPlan(plan, 4);
+            got += (o.error.empty() ? show(o.rows) : o.error) + "\n";
+        }
+        return got == "R1.b INT (1) (2) (2) [3 rows]\n(1) (2) [2 rows]\n(1) (2) [2 rows]\n(1) (2) (2) [3 rows]\n(2, 2) (2, 2) (2, 2) (2, 2) [4 rows]\n"
+                      "Node 'union' (root): inputs have 1 and 2 columns.\n" ? "" : got;
+    }},
+    {"a count over a join of tuples longer than a page of a temporary file streams, and a sort of them is an error, not a loss", [] {
+        std::string pairs = join("nested_loop_join", "L8.id = 0", scan("L8"), scan("R8"));
+        Outcome counted = runPlan(unary("group_by", "\"mode\":\"sort\",\"keys\":[],\"aggregates\":[[\"count\",\"*\"]]", pairs), 4);
+        Outcome sorted = runPlan(unary("sort", "\"keys\":[[\"R8.rid\",\"asc\"]]", pairs), 4);
+        std::string got = show(counted.rows) + counted.error + " | " + sorted.error;
+        return got == "(5) [1 rows] | error: a tuple of 4085 bytes does not fit on a page of a temporary file" ? "" : got;
+    }},
+    {"a column projected twice keeps both copies", [] {
+        Outcome o = runPlan(project("[\"R1.b\",[\"R1.b\",\"again\"]]", scan("R1")), 4);
+        return show(o.rows) == "(1, 1) (2, 2) (2, 2) (3, 3) [4 rows]" ? "" : show(o.rows) + o.error;
+    }},
+    {"a nested loop join with a memory-holding input on each side runs at B = 4", [] {
+        auto grouped = [](const std::string& key, const std::string& aggregate, const std::string& child) {
+            return unary("group_by", "\"mode\":\"hash\",\"keys\":[" + q(key) + "],\"aggregates\":[" + aggregate + "]", child);
+        };
+        std::string problems;
+        for (const std::string& plan : {join("nested_loop_join", "R.b = T.b", unary("distinct", "\"mode\":\"hash\"", project("[\"R.b\"]", scan("R"))), unary("distinct", "\"mode\":\"hash\"", project("[\"T.b\"]", scan("T")))),
+                                        join("nested_loop_join", "R1.b = S1.b", unary("sort", "\"keys\":[[\"R1.b\",\"desc\"]]", scan("R1")), unary("sort", "\"keys\":[[\"S1.b\",\"asc\"]]", scan("S1"))),
+                                        join("nested_loop_join", "R1.b = y.b", join("nested_loop_join", "R1.b = S1.b", scan("R1"), scan("S1")), join("nested_loop_join", "x.b = y.b", rename("x", scan("R1")), rename("y", scan("S1")))),
+                                        join("nested_loop_join", "R.b = T.b", grouped("R.b", "[\"count\",\"*\"]", scan("R")), grouped("T.b", "[\"sum\",\"T.d\"]", scan("T")))}) {
+            Outcome small = runPlan(plan, 4), large = runPlan(plan, 64);
+            if (!small.error.empty() || small.rows.empty() || !sameBag(small.rows, large.rows) || small.peak > 4 || small.held != 0 || small.tempFilesLeft)
+                problems += plan + "\n  " + (small.error.empty() ? show(small.rows) + " want " + show(large.rows) + " peak " + std::to_string(small.peak) : small.error) + "\n";
+        }
+        return problems;
+    }},
+    {"a group_by with no keys as the inner of a nested loop join is aggregated once, not once per block", [] {
+        Outcome o = runPlan(join("nested_loop_join", "R.b < count_star", scan("R"), unary("group_by", "\"mode\":\"sort\",\"keys\":[],\"aggregates\":[[\"count\",\"*\"]]", scan("T"))), 4);
+        const Operator& t = *o.root->children[1]->children[0];
+        long long pages;
+        {
+            Database db(DIR, 4);
+            pages = db.table("T").dataPages;
+        }
+        long long blocks = std::stoll(o.root->notes.substr(o.root->notes.find("blocks=") + 7));
+        std::string got = std::to_string(o.rows.size()) + " rows, T read " + std::to_string(t.counters.io.reads) + o.error;
+        return blocks > 1 && got == "3000 rows, T read " + std::to_string(pages + 1) ? "" : got + " " + o.root->notes;
+    }},
+    {"hash group_by holds only the keys and the aggregates' state, and never more bytes than its frames", [] {
+        std::string plan = unary("group_by", "\"mode\":\"hash\",\"keys\":[\"Names.g\"],\"aggregates\":[[\"max\",\"Names.name\"],[\"min\",\"Names.name\"]]", scan("Names"));
+        std::string problems;
+        std::vector<Row> rows;
+        {
+            Database db(DIR, 4);
+            std::unique_ptr<Operator> root = buildPlan(db, parseJson(plan));
+            db.pool.clear();
+            root->open();
+            const HashGrouping& grouping = *dynamic_cast<HashGroupBy&>(*root).grouping;
+            auto check = [&] {
+                size_t bytes = 0;
+                for (const HashGrouping::Entry& e : grouping.entries) {
+                    bytes += SLOT_SIZE + encodedSize(grouping.keySchema, e.key);
+                    for (const AggState& s : e.states) bytes += 8 + 2 + s.extreme.text.size();
+                }
+                if (bytes > size_t(grouping.frames.count() * USABLE_SPACE) && problems.empty())
+                    problems = std::to_string(bytes) + " bytes held in " + std::to_string(grouping.frames.count()) + " frames after " + std::to_string(rows.size()) + " rows\n";
+            };
+            check();
+            Row row;
+            while (root->next(row)) { rows.push_back(row); check(); }
+            root->close();
+        }
+        Outcome sorted = runPlan(std::string(plan).replace(plan.find("hash"), 4, "sort"), 4);
+        return problems + (rows.size() == 120 && sameBag(rows, sorted.rows) ? "" : show(rows) + " want " + show(sorted.rows));
+    }},
+    {"a set operation of INT and REAL prints its column one way at every B", [] {
+        std::string average = project("[\"avg_S1_b\"]", unary("group_by", "\"mode\":\"sort\",\"keys\":[],\"aggregates\":[[\"avg\",\"S1.b\"]]", scan("S1")));
+        std::string mean = project("[\"mean\"]", unary("group_by", "\"mode\":\"hash\",\"keys\":[],\"aggregates\":[[\"avg\",\"R1.b\",\"mean\"]]", scan("R1")));
+        std::string got = show(runPlan(binary("union_all", project("[\"R1.b\"]", scan("R1")), average), 4).rows) + "\n" +
+                          show(runPlan(binary("intersect", project("[\"R1.b\"]", scan("R1")), mean), 4).rows) + "\n" +
+                          show(runPlan(binary("except", project("[\"R1.b\"]", scan("R1")), mean), 64).rows) + "\n";
+        for (int b : {4, 64}) got += show(runPlan(binary("union", project("[\"R.b\"]", scan("R")), average), b).rows, 4) + "\n";
+        return got == "(1.0000) (2.0000) (2.0000) (3.0000) (2.6667) [5 rows]\n(2.0000) [1 rows]\n(1.0000) (3.0000) [2 rows]\n"
+                      "(0.0000) (1.0000) (2.0000) (2.6667) [41 rows]\n(0.0000) (1.0000) (2.0000) (2.6667) [41 rows]\n" ? "" : got;
+    }},
+    {"AVG rounds a half away from zero and never prints -0.0000", [] {
+        Outcome o = runPlan(unary("group_by", "\"mode\":\"sort\",\"keys\":[\"Tie.g\"],\"aggregates\":[[\"avg\",\"Tie.v\"]]", scan("Tie")), 4);
+        return show(o.rows) == "(0, 0.0313) (1, -0.0313) (2, 0.0000) [3 rows]" ? "" : show(o.rows) + o.error;
+    }},
+    {"SUM and AVG of an AVG column are REAL, in either mode", [] {
+        std::string averages = unary("group_by", "\"mode\":\"sort\",\"keys\":[\"Tie.g\"],\"aggregates\":[[\"avg\",\"Tie.v\"]]", scan("Tie")), got;
+        for (const char* mode : {"sort", "hash"}) {
+            Outcome o = runPlan(unary("group_by", std::string("\"mode\":\"") + mode + "\",\"keys\":[\"Tie.g\"],\"aggregates\":[[\"sum\",\"avg_Tie_v\"],[\"avg\",\"avg_Tie_v\"]]", averages), 4);
+            std::string rows = show(o.rows);
+            if (rows != "(0, 0.0313, 0.0313) (1, -0.0313, -0.0313) (2, 0.0000, 0.0000) [3 rows]") got += std::string(mode) + ": " + rows + o.error + "\n";
+        }
+        return got;
+    }},
+    {"group_by in either mode, with and without keys, over a memory-holding input leaves no temporary file", [] {
+        std::string joined = join("hash_join", "R.b = S.b", scan("R"), scan("S")), got;
+        size_t pairs = oracle(joined).size();
+        for (const char* mode : {"sort", "hash"})
+            for (const char* keys : {"", "\"S.c\""}) {
+                Outcome o = runPlan(unary("group_by", std::string("\"mode\":\"") + mode + "\",\"keys\":[" + keys + "],\"aggregates\":[[\"count\",\"*\"]]", joined), 4);
+                long long counted = 0;
+                for (const Row& r : o.rows) counted += (long long)r.back().num;
+                if (!o.error.empty() || o.tempFilesLeft || o.held != 0 || counted != (long long)pairs)
+                    got += std::string(mode) + " [" + keys + "] " + o.error + (o.tempFilesLeft ? " left a temporary file" : "") + " counted " + std::to_string(counted) + "\n";
+            }
+        return got;
+    }},
+    {"JSON nested more than 1000 deep is an error with its place, and a plan of 900 nested nodes runs", [] {
+        std::string node = "{\"op\":\"limit\",\"n\":2,\"child\":", got;
+        std::string deepPlan, deepArray = std::string(50000, '[') + std::string(50000, ']');
+        for (int i = 0; i < 20000; i++) deepPlan += node;
+        deepPlan += scan("R1") + std::string(20000, '}');
+        for (const std::string* text : {&deepPlan, &deepArray}) {
+            try { parseJson(*text); got += "parsed\n"; }
+            catch (const Error& e) { got += e.msg + " at " + std::to_string(e.line) + ":" + std::to_string(e.col) + "\n"; }
+        }
+        std::string plan = scan("R1");
+        for (int i = 0; i < 900; i++) plan = unary("limit", "\"n\":2", plan);
+        got += show(runPlan(plan, 4).rows);
+        std::string tooDeep = "json syntax error: arrays and objects nested more than 1000 deep at 1:";
+        return got == tooDeep + std::to_string(1000 * node.size() + 1) + "\n" + tooDeep + "1001\n(1) (2) [2 rows]" ? "" : got;
+    }},
+    {"exec trace is a line per node, its four counters then its own fields, and no total line", [] {
+        std::ofstream(DIR + "/trace.json") << join("hash_join", "R1.b = S1.b", scan("R1"), scan("S1"));
+        std::ostringstream out;
+        execTool({"trace", "--db", DIR, "--plan", DIR + "/trace.json", "--frames", "4"}, out);
+        std::filesystem::remove(DIR + "/trace.json");
+        std::string want = "hash_join tuples_out=4 comparisons=6 reads=2 writes=4 partitions=3 pages_left/right=[1/1,0/1,1/0] overflowed=0\n"
+                           "  seqscan R1 tuples_out=4 comparisons=0 reads=2 writes=0\n"
+                           "  seqscan S1 tuples_out=3 comparisons=0 reads=2 writes=0\n";
+        return out.str() == want ? "" : out.str();
+    }},
+    {"hash distinct partitions B - 1 ways, to as many levels as the formula says, with the formula's I/O", [] {
+        long long pages;
+        {
+            Database db(DIR, 4);
+            pages = db.table("SkewL").dataPages;
+        }
+        std::string problems;
+        for (int b : {4, 5, 8, 16}) {
+            Outcome o = runPlan(unary("distinct", "\"mode\":\"hash\"", scan("SkewL")), b);
+            int work = b - 1, levels = 0;
+            double formula = 0;
+            for (double inputs = 1; double(pages) / inputs > work; inputs *= work, levels++) formula += 2 * work * inputs + 2 * inputs * work * std::ceil(double(pages) / (inputs * work));
+            double io = double(o.root->counters.io.reads + o.root->counters.io.writes);
+            std::string start = "levels=" + std::to_string(levels) + " partitions=" + std::to_string(work) + " ";
+            if (o.root->notes.rfind(start, 0) != 0 || io < formula || io > formula * 1.1 || o.rows.size() != 4000)
+                problems += "B=" + std::to_string(b) + " " + o.root->notes + " io " + std::to_string(io) + " formula " + std::to_string(formula) + " want " + start + "\n";
+        }
+        return problems;
+    }},
     {"plans that do not conform are rejected naming the node", [] {
         std::string got;
         for (const std::string& plan : {std::string("{\"op\":\"sort\",\"child\":") + scan("R") + "}",
@@ -299,7 +472,10 @@ const std::vector<Test> TESTS = {
                                         std::string("{\"child\":") + scan("R") + "}",
                                         std::string("[1]"),
                                         std::string("{\"op\":\"filter\",\"condition\":\"R.a > 1\",\"child\":{\"op\":\"seqscan\",\"table\":\"R\"}"),
-                                        std::string("{\"op\":\"seqscan\",\"table\":\"R\",}")})
+                                        std::string("{\"op\":\"seqscan\",\"table\":\"R\",}"),
+                                        std::string("{\"op\":\"except\",\"child\":") + scan("R1") + ",\"left\":" + scan("R1") + ",\"right\":" + scan("S1") + "}",
+                                        std::string("{\"op\":\"limit\",\"n\":1,\"child\":") + scan("R1") + ",\"right\":" + scan("S1") + "}",
+                                        project("[\"R1.b\"]", std::string("{\"op\":\"seqscan\",\"table\":\"R1\",\"left\":") + scan("S1") + "}")})
             got += runPlan(plan, 4).error + "\n";
         std::string want =
             "Node 'sort' (root): missing required field 'keys'.\n"
@@ -311,7 +487,10 @@ const std::vector<Test> TESTS = {
             "Node at root: missing required field 'op'.\n"
             "Node at root: must be an object, not an array.\n"
             "json syntax error: expected ',' or '}' but found end of input\n"
-            "json syntax error: expected a string key but found '}'\n";
+            "json syntax error: expected a string key but found '}'\n"
+            "Node 'except' (root): unexpected field 'child'.\n"
+            "Node 'limit' (root): unexpected field 'right'.\n"
+            "Node 'seqscan' (root.child): unexpected field 'left'.\n";
         return got == want ? "" : got;
     }},
     {"unknown tables and columns are rejected before anything runs", [] {

@@ -205,9 +205,12 @@ including the "other grouping gives a different answer" checks for cases 10 to 1
 - Everything is in memory; the join is a nested loop with no indexes, which the performance study
   measures on purpose.
 - Two limits stop deep input from overflowing the stack. They produce `syntax error: nesting too deep`
-  instead of a crash. First, the parser allows at most 500 parentheses, unary operators and `not`s open
-  at once, so 500 nested parentheses parse and 501 do not. Second, a parse tree may be at most 500 nodes
-  deep: a chain of 499 `union`s parses and 500 do not, and each unary operator or `not` adds a level too.
+  or `syntax error: condition too long` instead of a crash. First, the parser allows at most 500
+  parentheses, unary operators and `not`s open at once, so 500 nested parentheses parse and 501 do not.
+  Second, a parse tree may be at most 500 levels of nesting and 2000 levels in all. A chain of `and`s
+  or `or`s counts as one level of nesting, so a 2000-term condition is "condition too long". A chain of
+  499 `union`s parses and 500 do not, and each unary operator or `not` adds a level. The SQL front end
+  has its own limits, in GRAMMAR_SQL.md §5, and a plan file may nest at most 1000 levels deep.
 - Columns in error positions count bytes, so a multibyte character counts as more than one column.
 
 ## Project 2: the database system
@@ -232,6 +235,7 @@ Every module also runs on its own, exactly as its specification asks:
 storage create-table --db DIR --name R --schema "a:INT,b:VARCHAR(20)"   storage load --db DIR --table R --file r.csv
 storage scan --db DIR --table R --frames 8 [--limit N] --json           storage layout --db DIR --table R --page 3
 storage trace --db DIR --file trace.txt --frames 16 --policy lru|clock --json
+(every command takes --frames B; the buffer policy is CLOCK unless --policy lru is given)
 exec run --db DIR --plan plan.json --frames 32 --json                   exec trace --db DIR --plan plan.json --frames 32
 sql parse --query "SELECT ..." --explain     sql compile --db DIR --file q.sql --json     sql check --db DIR --file q.sql
 opt analyze --db DIR --table R --buckets 20  opt plan --db DIR --logical q.json --frames 32 --json
@@ -252,10 +256,10 @@ Tests (`make test`): `tests/test.cpp` (the 25 Bonus 1 cases under bag semantics,
 every node type), `tests/test_storage.cpp` (M1's worked examples, error table and checklist),
 `tests/test_exec.cpp` (M2's examples and checklist, and 64 plans checked against the Bonus 1 engine at
 B = 4, 5, 8 and 64), `tests/test_sql.cpp` (M3's seven examples and fifteen cases), and
-`tests/test_opt.cpp` (M4's examples and checklist, and SQL run through all four modules optimised and
-unoptimised). `python3 tests/e2e/run.py SCALE "psql connection args"` runs 44 queries through the four
-tools chained by file, at B = 4, 8 and 32, optimised and unoptimised, and checks every result against
-PostgreSQL on the same data; all 258 runs agree.
+`tests/test_opt.cpp` (M4's examples and checklist, SQL run through all four modules optimised and
+unoptimised, and the `db` shell's commands and error positions). `python3 tests/e2e/run.py SCALE "psql connection args"` runs 44 queries
+through the four tools chained by file, optimised and unoptimised, and through the `db` shell, at B = 4,
+8 and 32, and checks every result against PostgreSQL on the same data; all 390 runs agree.
 
 Measurements: `python3 perf/m1.py`, `perf/m2.py` and `perf/m4.py` regenerate every table of the three
 reports into `perf/m1/`, `perf/m2/` and `perf/m4/`.
@@ -264,6 +268,10 @@ Known limitations of Project 2:
 - No NULLs, no arithmetic, no subqueries outside FROM, and no outer joins: the subset of the
   specification and nothing more.
 - No compaction of deleted space, and no index.
-- A tuple of a temporary file must fit on one page, so a join of two very wide tables (over 4088 bytes
-  together) cannot be sorted or partitioned.
-- Identifiers are case sensitive, as Module 3 requires, so unlike PostgreSQL `emp` is not `Emp`.
+- A record must fit on one page, so it can be at most 4084 bytes: a longer row is refused when it is
+  loaded or inserted, and a join of two very wide tables (over 4084 bytes together) cannot be sorted or
+  partitioned.
+- Identifiers are case sensitive, as Module 3 requires, so unlike PostgreSQL `emp` is not `Emp`. But
+  each table is a file, so two table names that differ only in case are refused (they would share a
+  file on a case-insensitive file system), and no table may be called `catalog`.
+- A plan needs at least 4 frames (`opt plan`, `SET frames`, `db --frames`).

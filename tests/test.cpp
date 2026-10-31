@@ -121,7 +121,8 @@ const Case CASES[] = {
     {"x66 left operand is checked first", {F, "Nope1 union Nope2"}, "name error: unknown relation Nope1 at line 1 col 1\n", 1},
     {"x67 chain of 499 operators parses", {"A" + [] { std::string s; for (int i = 0; i < 499; i++) s += " union A"; return s; }()}, ""},
     {"x68 chain of 500 operators is too deep", {"A" + [] { std::string s; for (int i = 0; i < 500; i++) s += " union A"; return s; }()}, "syntax error: nesting too deep at line 1 col 3995\n", 1},
-    {"x69 long condition chain is too deep not a crash", {F, "select[" + [] { std::string s; for (int i = 0; i < 600; i++) s += "a=1 and "; return s + "a=1](R)"; }()}, "syntax error: nesting too deep at line 1 col 3996\n", 1},
+    {"x69 a long condition chain is one level of nesting", {F, "select[" + [] { std::string s; for (int i = 0; i < 600; i++) s += "a=1 and "; return s + "a=1](R)"; }()},
+     RH + R1 + R2},
     {"x70 unknown flag", {"--help"}, "usage: ra [--tree] [--tokens] [--json] [--stats] [datafile] \"query\"\n", 2},
     {"x71 text after the closing brace", {"tests/bad_brace2.txt", "R"}, "syntax error: unexpected text after '}' at line 3 col 2\n", 1},
 
@@ -136,6 +137,8 @@ const Case CASES[] = {
     {"x79 json", {"--json", "project[R.a](select[a>1 and not b='x'](R))"},
      "{\n  \"op\": \"project\",\n  \"columns\": [\"R.a\"],\n  \"child\": {\n    \"op\": \"select\",\n    \"condition\": \"a > 1 and not b = 'x'\",\n    \"child\": {\n      \"op\": \"scan\",\n      \"table\": \"R\"\n    }\n  }\n}\n"},
     {"x80 distinct as a relation name is a keyword", {"--tree", "distinct"}, "syntax error: expected '(' but found end of input at line 1 col 9\n", 1},
+    {"x81 a condition taller than 2000 levels is an error not a crash", {F, "select[" + [] { std::string s; for (int i = 0; i < 1999; i++) s += "a=1 and "; return s + "a=1](R)"; }()},
+     "syntax error: condition too long at line 1 col 15996\n", 1},
 };
 
 // every node type and every condition operator, parenthesised the way condText must reproduce
@@ -188,6 +191,16 @@ int main() {
         bindCond(c, cols);
         Row match = {{true, 2, "2"}, {true, 2, "2.0"}, {false, 0, "y"}}, miss = {{true, 2, "2"}, {true, 3, "3"}, {false, 0, "y"}};
         if (!eval(c, match) || eval(c, miss)) { fails++; std::cout << "FAIL condition parser on its own\n"; }
+    }
+    // a name alone means the column of no relation when there is one, which is how a plan names aliases
+    {
+        total++;
+        std::vector<Col> cols = {{"d", "budget", RealT}, {"", "budget", RealT}, {"e", "did", RealT}, {"d", "did", RealT}};
+        Node alone = parseCondition("budget = d.budget"), twice = parseCondition("did = 1");
+        bindCond(alone, cols);
+        std::string error;
+        try { bindCond(twice, cols); } catch (const Error& e) { error = e.msg; }
+        if (alone.kids[0].idx != 1 || alone.kids[1].idx != 0 || error != "name error: ambiguous attribute did") { fails++; std::cout << "FAIL a name alone means the column of no relation\n"; }
     }
     std::cout << total - fails << "/" << total << " passed\n";
     return fails != 0;

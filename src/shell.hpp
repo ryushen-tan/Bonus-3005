@@ -3,33 +3,39 @@
 #include "opt.hpp"
 #include <unistd.h>
 
-// statements end at a semicolon that is not inside a string or a comment
-inline std::vector<std::string> splitStatements(const std::string& text, std::string& rest) {
-    std::vector<std::string> out;
-    size_t start = 0;
+// statements end at a semicolon that is not inside a string or a comment; the positions of those semicolons
+inline std::vector<size_t> statementEnds(const std::string& text) {
+    std::vector<size_t> out;
     bool quote = false;
     for (size_t i = 0; i < text.size(); i++) {
         char c = text[i];
         if (quote) { if (c == '\'') quote = false; continue; }
         if (c == '\'') quote = true;
-        else if (c == '-' && i + 1 < text.size() && text[i + 1] == '-') while (i < text.size() && text[i] != '\n') i++;
-        else if (c == ';') { out.push_back(text.substr(start, i - start)); start = i + 1; }
+        else if (text.compare(i, 2, "--") == 0) i = std::min(text.find('\n', i), text.size());
+        else if (c == ';') out.push_back(i);
     }
-    rest = text.substr(start);
     return out;
 }
 inline std::string trim(const std::string& s) {
     size_t a = s.find_first_not_of(" \t\r\n"), b = s.find_last_not_of(" \t\r\n");
     return a == std::string::npos ? "" : s.substr(a, b - a + 1);
 }
-// the words of a shell command, a quoted string kept whole
+// the first position from i on that is not blank, in a comment, or the semicolon that ends the statement
+inline size_t skipBlank(const std::string& s, size_t i) {
+    while (i < s.size()) {
+        if (s.compare(i, 2, "--") == 0) i = std::min(s.find('\n', i), s.size());
+        else if (std::string(" \t\r\n;").find(s[i]) != std::string::npos) i++;
+        else break;
+    }
+    return i;
+}
+// the words of a shell command: a quoted string kept whole, = a word of its own, and comments left out
 inline std::vector<std::string> words(const std::string& s) {
     std::vector<std::string> out;
-    for (size_t i = 0; i < s.size();) {
-        if (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r' || s[i] == '=') { if (s[i] == '=') out.push_back("="); i++; continue; }
-        size_t j = i;
+    for (size_t i = skipBlank(s, 0); i < s.size(); i = skipBlank(s, i)) {
+        size_t j = i + 1;
         if (s[i] == '\'') { j = s.find('\'', i + 1); j = j == std::string::npos ? s.size() : j + 1; }
-        else while (j < s.size() && s[j] != ' ' && s[j] != '\t' && s[j] != '\n' && s[j] != '\r' && s[j] != '=') j++;
+        else if (s[i] != '=') while (j < s.size() && skipBlank(s, j) == j && s[j] != '=') j++;
         out.push_back(s.substr(i, j - i));
         i = j;
     }
@@ -41,6 +47,8 @@ struct Shell {
     int frames;
     std::unique_ptr<Database> db;
     std::ostream& out;
+    // where in the whole input the next statement starts, so that errors give positions in the input
+    int line = 1, column = 1;
 
     Shell(std::string directory, int f, std::ostream& o) : dir(std::move(directory)), frames(f), db(std::make_unique<Database>(dir, f)), out(o) {}
 
@@ -110,21 +118,27 @@ struct Shell {
         std::string first = w.empty() ? "" : upper(w[0]);
         if (first == "EXPLAIN") {
             bool analyze = w.size() > 1 && upper(w[1]) == "ANALYZE";
-            std::string query = text.substr(upper(text).find(analyze ? "ANALYZE" : "EXPLAIN") + 7);
+            size_t start = skipBlank(text, 0) + w[0].size();
+            if (analyze) start = skipBlank(text, start) + w[1].size();
+            // the words before the query are blanked rather than cut off, so the query keeps its positions
+            std::string query = text;
+            for (size_t i = 0; i < start; i++) if (query[i] != '\n') query[i] = ' ';
             std::vector<Statement> s = parseSql(query);
             if (s.size() != 1 || s[0].kind != Statement::Select) throw Error{"error: EXPLAIN takes one SELECT"};
             if (analyze) select(*s[0].query, true);
             else printExplain(plan(*s[0].query), out);
         }
-        else if (first == "ANALYZE" && w.size() >= 2) {
+        else if (first == "ANALYZE") {
+            bool withBuckets = w.size() == 3 && w[2].size() < 10 && std::all_of(w[2].begin(), w[2].end(), dig);
+            if (w.size() != 2 && !withBuckets) throw Error{"error: write ANALYZE table [buckets], with buckets from 1 to 999999999"};
             Table& t = db->table(w[1]);
-            analyzeTable(*db, t, w.size() >= 3 ? std::stoi(w[2]) : 20);
+            analyzeTable(*db, t, withBuckets ? std::stoi(w[2]) : 20);
             out << "ANALYZE " << t.name << ": " << t.stats.tuples << " tuples, " << t.stats.pages << " pages\n";
         }
         else if (first == "SET") {
             if (w.size() != 4 || upper(w[1]) != "FRAMES" || w[2] != "=" || !std::all_of(w[3].begin(), w[3].end(), dig) || w[3].size() > 6) throw Error{"error: write SET frames = n"};
             int n = std::stoi(w[3]);
-            if (n < 4) throw Error{"error: frames must be at least 4"};
+            if (n < MIN_PLAN_FRAMES) throw Error{"error: frames must be at least " + std::to_string(MIN_PLAN_FRAMES)};
             db.reset();
             frames = n;
             db = std::make_unique<Database>(dir, frames);
@@ -154,15 +168,29 @@ struct Shell {
         db->saveCatalog();
         out << "INSERT 1\n";
     }
-    // runs every complete statement in the text; an error stops that statement only
+    // runs one statement, which starts at line and column of the input; an error stops that statement only
+    bool runStatement(const std::string& text) {
+        try {
+            command(text);
+            return true;
+        } catch (const SqlError& e) {
+            out << sqlErrorText({e.category, e.message, line + e.line - 1, e.line == 1 ? column + e.col - 1 : e.col}) << '\n';
+        } catch (const Error& e) {
+            report(e, out);
+        } catch (const std::exception& e) {
+            out << "internal error: " << e.what() << '\n';
+        }
+        return false;
+    }
+    // runs every statement the text completes, and leaves what follows the last one in rest
     bool run(const std::string& text, std::string& rest) {
         bool ok = true;
-        for (const std::string& s : splitStatements(text, rest)) {
-            if (trim(s).empty()) continue;
-            try { command(trim(s)); }
-            catch (const SqlError& e) { out << sqlErrorText(e) << '\n'; ok = false; }
-            catch (const Error& e) { report(e, out); ok = false; }
+        size_t start = 0;
+        for (size_t end : statementEnds(text)) {
+            ok = runStatement(text.substr(start, end + 1 - start)) && ok;
+            for (; start <= end; start++) if (text[start] == '\n') { line++; column = 1; } else column++;
         }
+        rest = text.substr(start);
         return ok;
     }
 };
@@ -173,13 +201,15 @@ inline int shellTool(const std::vector<std::string>& args, std::istream& in, std
         withCommand.insert(withCommand.end(), args.begin(), args.end());
         Args a = parseArgs(withCommand, {});
         a.allow({"db", "frames", "file"});
-        Shell shell(a.need("db"), a.number("frames", 32), out);
-        if (shell.frames < 4) throw Error{"error: --frames must be at least 4"};
+        int frames = a.number("frames", 32);
+        if (frames < MIN_PLAN_FRAMES) throw Error{"error: --frames must be at least " + std::to_string(MIN_PLAN_FRAMES)};
+        Shell shell(a.need("db"), frames, out);
         bool ok = true;
         std::string pending;
+        // the text after the last semicolon is a statement too, and is run, or reported, at the end
         if (a.options.count("file")) {
-            ok = shell.run(readFile(a.need("file")) + ";", pending);
-            return ok ? 0 : 1;
+            ok = shell.run(readFile(a.need("file")), pending);
+            return shell.runStatement(pending) && ok ? 0 : 1;
         }
         bool interactive = &in == &std::cin && isatty(0);
         std::string line;
@@ -189,9 +219,10 @@ inline int shellTool(const std::vector<std::string>& args, std::istream& in, std
             std::string text = pending + line + "\n";
             ok = shell.run(text, pending) && ok;
         }
-        if (!trim(pending).empty()) ok = shell.run(pending + ";", pending) && ok;
-        return ok ? 0 : 1;
+        return shell.runStatement(pending) && ok ? 0 : 1;
     } catch (const Error& e) {
         return report(e, out);
+    } catch (const std::exception& e) {
+        return report(Error{std::string("internal error: ") + e.what()}, out);
     }
 }

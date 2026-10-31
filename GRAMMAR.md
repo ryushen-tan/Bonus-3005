@@ -319,4 +319,6 @@ the output, details and dates in `DESIGN_LOG.md`):
    at the four places where a construct can contain itself (parentheses in expressions and in
    conditions, the three unary operators, `not`) now turns that into `syntax error: nesting too deep`,
    and a second check refuses any tree deeper than 500 levels, because a chain of 25000 `and`s built a
-   tree that overflowed the evaluator's stack the same way.
+   tree that overflowed the evaluator's stack the same way. (Project 2 changed the second check: a
+   chain of `and`s or `or`s now counts as one level of nesting, and a tree may be 2000 levels high in
+   all, so a 2000-term condition is `syntax error: condition too long`.)

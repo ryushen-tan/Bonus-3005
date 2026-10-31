@@ -33,11 +33,13 @@ in header files under `src/`, one `.cpp` per tool.
 ```
 
 `src/shell.hpp` is the integration. It splits input into statements and handles `EXPLAIN`, `EXPLAIN
-ANALYZE`, `ANALYZE t`, `SET frames = n` and `LOAD t FROM 'file'` itself. SQL goes through M3, M4 and M2
-by calling the same functions the tools call: `SqlCompiler::query`, `Optimizer::optimize`, `physicalJson`,
-`buildPlan` and `execute`. Integration was wiring. No module was rewritten for it, and the four tools
-still work. `tests/e2e/run.py` chains the four tools by file, which is the strongest check that each
-contract is enough on its own.
+ANALYZE`, `ANALYZE t [buckets]`, `SET frames = n` and `LOAD t FROM 'file'` itself. SQL goes through M3,
+M4 and M2 by calling the same functions the tools call: `SqlCompiler::query`, `Optimizer::optimize`,
+`physicalJson`, `buildPlan` and `execute`. Each statement is parsed where it stands, so an error gives
+its line and column in the whole input, as `sql check` does, and text after the last semicolon is run
+(or reported) at the end of the input. Integration was wiring. No module was rewritten for it, and the
+four tools still work. `tests/e2e/run.py` chains the four tools by file, which is the strongest check
+that each contract is enough on its own, and runs each query through the shell as well.
 
 ## The interface between each pair
 
@@ -76,11 +78,13 @@ node.
 `condition` on `nested_loop_join`. M4 adds `est_rows` and `est_cost` to every node, which M2's checker
 allows and ignores, and which `EXPLAIN ANALYZE` puts beside the actual counts. The test of this contract
 is that every plan M4 emits runs in M2 unedited. The optimizer tests and the end to end run do that
-for 67 queries at several values of B.
+for 68 queries at several values of B.
 
-**The memory contract across M2 and M4.** M2 guarantees any plan runs within B frames, so M4 never has
-to check that a plan fits. M4's cost model uses the same formulas as M2's operators. Where M2 spends
-I/O the formulas do not count, that is measured in REPORT_M2.md rather than hidden.
+**The memory contract across M2 and M4.** M2 guarantees any plan of B ≥ 4 frames runs within them, so
+M4 never has to check that a plan fits. M4's cost model uses the same formulas as M2's operators, with
+the frames M2 gives each one: B, or B − 1 below an operator that holds memory, which keeps a frame free
+to write that input to a temporary file (DESIGN_M4.md section 4). Where M2 spends I/O the formulas do
+not count, that is measured in REPORT_M2.md rather than hidden.
 
 ## What I would do differently
 
@@ -114,4 +118,5 @@ collected by the same single scan of ANALYZE, would have fixed three of the five
 
 **Write the end to end check against PostgreSQL first.** It found no wrong answer at the end, but it
 would have been the fastest way to find the four modules' disagreements while they were being written,
-rather than from each module's own tests.
+rather than from each module's own tests. And it should have run the shell from the start: it only
+chained the tools by file, so it never saw that every query with a LIMIT crashed the shell.

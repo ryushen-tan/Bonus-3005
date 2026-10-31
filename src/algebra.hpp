@@ -38,13 +38,16 @@ inline void checkUnique(const std::vector<Col>& cols, int line, int col, const s
             if (cols[i].name == cols[j].name && cols[i].rel == cols[j].rel)
                 throw Error{"schema error: duplicate attribute " + qualified(cols[i]) + " in " + what, line, col};
 }
-// Name or Rel.Name has to match exactly one column
+// Rel.Name has to match exactly one column; Name alone means the column of that name with no relation (an
+// alias or an aggregate's output) when there is one, and otherwise has to match exactly one column
 inline size_t resolve(const std::vector<Col>& cols, Node& a) {
     size_t dot = a.val.text.find('.'), hit = cols.size();
     std::string rel = dot == std::string::npos ? "" : a.val.text.substr(0, dot);
     std::string name = dot == std::string::npos ? a.val.text : a.val.text.substr(dot + 1);
+    bool alone = dot == std::string::npos;
+    bool relationless = alone && std::any_of(cols.begin(), cols.end(), [&](const Col& c) { return c.rel.empty() && c.name == name; });
     for (size_t i = 0; i < cols.size(); i++)
-        if (cols[i].name == name && (dot == std::string::npos || cols[i].rel == rel)) {
+        if (cols[i].name == name && (alone ? cols[i].rel.empty() || !relationless : cols[i].rel == rel)) {
             if (hit < cols.size()) throw Error{"name error: ambiguous attribute " + a.val.text, a.line, a.col};
             hit = i;
         }

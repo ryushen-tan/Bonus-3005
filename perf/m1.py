@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Module 1 measurements: writes the five traces, runs ./storage, prints the tables for REPORT_M1.md
-import json, os, shutil, subprocess, sys
+# Module 1 measurements: writes the five traces, runs ./storage, writes the tables for REPORT_M1.md to perf/m1/results.md
+import contextlib, json, os, shutil, subprocess, sys
 
 OUT = 'perf/m1'
 DB = OUT + '/db'
@@ -13,7 +13,7 @@ def storage(*args):
 def lcg(seed):   # a fixed generator so the traces are the same on every machine
     while True:
         seed = (seed * 1103515245 + 12345) % 2 ** 31
-        yield seed
+        yield seed >> 16   # the low bits of a power-of-two LCG repeat with short periods: the lowest one alternates
 
 def traces():
     r = lcg(42)
@@ -30,8 +30,6 @@ def traces():
             '4 hot set of 10 pages mixed with a 300 page scan': mixed, '5 nested loop: 20 outer pages, 40 page inner scan': loop}
 
 def main():
-    shutil.rmtree(OUT, ignore_errors=True)
-    os.makedirs(OUT + '/traces')
     print('## Policies\n')
     print('| trace | accesses | distinct pages | B | LRU hits | LRU hit rate | CLOCK hits | CLOCK hit rate |')
     print('|---|---|---|---|---|---|---|---|')
@@ -70,4 +68,7 @@ def main():
         print('| %d | %d | %d | %d | %d | %d |' % (b, s['hits'], s['misses'], s['evictions'], s['reads'], s['writes']))
     shutil.rmtree(DB)
 
-main()
+shutil.rmtree(OUT, ignore_errors=True)
+os.makedirs(OUT + '/traces')
+with open(OUT + '/results.md', 'w') as results, contextlib.redirect_stdout(results):
+    main()

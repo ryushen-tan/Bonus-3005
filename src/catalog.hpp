@@ -5,6 +5,7 @@
 #include <deque>
 #include <filesystem>
 #include <sstream>
+#include <strings.h>
 
 struct Bucket { Value lo, hi; long long count, ndv; };
 // width is the column's average encoded size in bytes
@@ -43,12 +44,15 @@ struct Database {
     std::deque<Table> tables;
     uint32_t catalogFile;
 
-    Database(const std::string& directory, int frames, Policy policy = Lru) : dir(directory), pool(disk, frames, policy) {
-        std::filesystem::create_directories(dir);
-        bool fresh = !std::filesystem::exists(dir + "/catalog.db");
-        catalogFile = disk.open(dir + "/catalog.db");
-        if (fresh) HeapFile::create(pool, catalogFile);
-        else readCatalog();
+    Database(const std::string& directory, int frames, Policy policy = Clock) : dir(directory), pool(disk, frames, policy) {
+        createDirectories(dir);
+        if (std::filesystem::exists(dir + "/catalog.db")) {
+            catalogFile = disk.open(dir + "/catalog.db");
+            readCatalog();
+        } else {
+            catalogFile = disk.create(dir + "/catalog.db");
+            HeapFile::create(pool, catalogFile);
+        }
         pool.clear();
     }
     Database(const Database&) = delete;
@@ -98,33 +102,43 @@ struct Database {
             h[at] = {parsedValue(c, r[4].text), parsedValue(c, r[5].text), (long long)r[6].num, (long long)r[7].num};
         }
     }
-    // the whole catalog is small, so a change rewrites catalog.db from the first page
+    // the whole catalog is small, so a change writes all of it to a new file and renames that over catalog.db:
+    // a process that dies before the rename leaves the old catalog whole
     void saveCatalog() {
-        pool.dropFile(catalogFile);
-        disk.truncate(catalogFile, 0);
-        HeapFile::create(pool, catalogFile);
-        uint32_t pages = 1, tuples = 0;
-        HeapFile heap{pool, catalogFile, pages, tuples};
-        auto put = [&](int kind, Row values) {
-            values.insert(values.begin(), intValue(kind));
-            heap.insert(encode(recordSchema(kind), values));
-        };
-        auto num = [](long long n) { return intValue(n); };
-        for (const Table& t : tables) {
-            put(TableRecord, {textValue(t.name), textValue(t.fileName), num(t.dataPages), num(t.liveTuples)});
-            for (size_t i = 0; i < t.cols.size(); i++)
-                put(ColumnRecord, {textValue(t.name), num(long(i)), textValue(t.cols[i].name), num(t.cols[i].type == StrT), num(t.cols[i].length)});
-            if (!t.stats.analyzed) continue;
-            auto exact = [](double d) { char text[32]; std::snprintf(text, sizeof text, "%.17g", d); return textValue(text); };
-            put(TableStatsRecord, {textValue(t.name), num(t.stats.tuples), num(t.stats.pages), exact(t.stats.width)});
-            for (size_t i = 0; i < t.cols.size(); i++) {
-                const ColumnStats& s = t.stats.columns[i];
-                put(ColumnStatsRecord, {textValue(t.name), num(long(i)), num(s.ndv), textValue(s.ndv ? s.min.text : ""), textValue(s.ndv ? s.max.text : ""), exact(s.width)});
-                for (size_t b = 0; b < s.histogram.size(); b++)
-                    put(BucketRecord, {textValue(t.name), num(long(i)), num(long(b)), textValue(s.histogram[b].lo.text), textValue(s.histogram[b].hi.text), num(s.histogram[b].count), num(s.histogram[b].ndv)});
+        uint32_t next = disk.createTemp(dir);
+        try {
+            HeapFile::create(pool, next);
+            uint32_t pages = 1, tuples = 0;
+            HeapFile heap{pool, next, pages, tuples, "catalog"};
+            auto put = [&](int kind, Row values) {
+                values.insert(values.begin(), intValue(kind));
+                heap.insert(encode(recordSchema(kind), values));
+            };
+            auto num = [](long long n) { return intValue(n); };
+            for (const Table& t : tables) {
+                put(TableRecord, {textValue(t.name), textValue(t.fileName), num(t.dataPages), num(t.liveTuples)});
+                for (size_t i = 0; i < t.cols.size(); i++)
+                    put(ColumnRecord, {textValue(t.name), num(long(i)), textValue(t.cols[i].name), num(t.cols[i].type == StrT), num(t.cols[i].length)});
+                if (!t.stats.analyzed) continue;
+                auto exact = [](double d) { char text[32]; std::snprintf(text, sizeof text, "%.17g", d); return textValue(text); };
+                put(TableStatsRecord, {textValue(t.name), num(t.stats.tuples), num(t.stats.pages), exact(t.stats.width)});
+                for (size_t i = 0; i < t.cols.size(); i++) {
+                    const ColumnStats& s = t.stats.columns[i];
+                    put(ColumnStatsRecord, {textValue(t.name), num(long(i)), num(s.ndv), textValue(s.ndv ? s.min.text : ""), textValue(s.ndv ? s.max.text : ""), exact(s.width)});
+                    for (size_t b = 0; b < s.histogram.size(); b++)
+                        put(BucketRecord, {textValue(t.name), num(long(i)), num(long(b)), textValue(s.histogram[b].lo.text), textValue(s.histogram[b].hi.text), num(s.histogram[b].count), num(s.histogram[b].ndv)});
+                }
             }
+            pool.flushAll();
+            disk.rename(next, dir + "/catalog.db");
+        } catch (...) {
+            pool.dropFile(next);
+            disk.remove(next);
+            throw;
         }
-        pool.flushAll();
+        pool.dropFile(catalogFile);
+        disk.close(catalogFile);
+        catalogFile = next;
     }
 
     Table* find(const std::string& name) {
@@ -136,20 +150,38 @@ struct Database {
         if (!t) throw Error{"error: unknown table " + name};
         return *t;
     }
+    // a table's name is its file's name too, <name>.db, and file systems such as macOS's ignore case. So the
+    // name is an identifier short enough for the 255 bytes a file name may have, never catalog in any case,
+    // and never an existing table's name in another case
     Table& createTable(const std::string& name, std::vector<Col> cols) {
+        bool identifier = !name.empty() && !dig(name[0]) && std::all_of(name.begin(), name.end(), wordChar);
+        if (!identifier) throw Error{"error: table name '" + name + "' must be a letter or underscore followed by letters, digits and underscores"};
+        if (name.size() > 252) throw Error{"error: table name " + name + " is longer than 252 characters, the most that leaves room for .db in a file name"};
+        if (::strcasecmp(name.c_str(), "catalog") == 0) throw Error{"error: table name " + name + " is taken by the catalog's own file, catalog.db"};
         if (find(name)) throw Error{"error: table " + name + " already exists"};
-        for (Col& c : cols) c.rel = name;
+        for (const Table& t : tables)
+            if (::strcasecmp(t.name.c_str(), name.c_str()) == 0) throw Error{"error: table " + name + " would share a file with table " + t.name + ": table names may not differ only in case"};
+        for (Col& c : cols) {
+            if (c.name.size() > 255) throw Error{"error: column name " + c.name + " is longer than 255 characters"};
+            c.rel = name;
+        }
         checkUnique(cols, 0, 0, "table " + name);
         Table t{name, name + ".db", cols, 0, 0, {}, 0};
         t.stats.columns.resize(cols.size());
-        std::filesystem::remove(dir + "/" + t.fileName);
-        t.file = disk.open(dir + "/" + t.fileName);
-        HeapFile::create(pool, t.file);
+        t.file = disk.create(dir + "/" + t.fileName);
         tables.push_back(t);
-        saveCatalog();
+        try {
+            HeapFile::create(pool, t.file);
+            saveCatalog();
+        } catch (...) {
+            tables.pop_back();
+            pool.dropFile(t.file);
+            disk.remove(t.file);
+            throw;
+        }
         return tables.back();
     }
-    HeapFile heap(Table& t) { return {pool, t.file, t.dataPages, t.liveTuples}; }
+    HeapFile heap(Table& t) { return {pool, t.file, t.dataPages, t.liveTuples, t.name}; }
 };
 
 // "a:INT,b:VARCHAR(20)", types in any case
@@ -173,8 +205,9 @@ inline std::vector<Col> parseSchema(const std::string& text) {
             while (i < text.size() && dig(text[i])) i++;
             if (i == start || i >= text.size() || text[i] != ')') throw fail("expected a length and ')'");
             c.type = StrT;
-            c.length = std::stoi(text.substr(start, i - start));
-            if (c.length < 1 || c.length > 255) throw fail("VARCHAR length must be 1 to 255");
+            long long length = std::strtoll(text.c_str() + start, nullptr, 10);
+            if (length < 1 || length > 255) throw fail("VARCHAR length must be 1 to 255");
+            c.length = int(length);
             i++;
         }
         else if (type != "INT") throw fail("expected INT or VARCHAR(n)");
@@ -185,17 +218,19 @@ inline std::vector<Col> parseSchema(const std::string& text) {
     }
 }
 
-// a field must fit its column: an INT in 32 bits, a VARCHAR(n) in n bytes
+// a field must fit its column: an INT in 32 bits, a VARCHAR(n) in n bytes of UTF-8. strtoll reads an INT by
+// value, leading zeros and all, and saturates past the range of a long long, which is far outside 32 bits
 inline Value checkedValue(const Col& c, const std::string& field, const std::string& where) {
     if (c.type == StrT) {
+        size_t invalid = invalidUtf8At(field);
+        if (invalid != std::string::npos) throw Error{"error: " + where + ": byte " + std::to_string(invalid + 1) + " is not valid UTF-8"};
         if (int(field.size()) > c.length) throw Error{"error: " + where + ": '" + field + "' is longer than VARCHAR(" + std::to_string(c.length) + ")"};
         return textValue(field);
     }
     size_t i = field.size() && (field[0] == '-' || field[0] == '+') ? 1 : 0;
-    bool digits = i < field.size();
-    for (size_t k = i; k < field.size(); k++) digits = digits && dig(field[k]);
-    long long n = digits && field.size() <= 11 ? std::stoll(field) : 0;
-    if (!digits || field.size() > 11 || n < INT32_MIN || n > INT32_MAX) throw Error{"error: " + where + ": '" + field + "' is not an INT"};
+    bool digits = i < field.size() && std::all_of(field.begin() + i, field.end(), dig);
+    long long n = digits ? std::strtoll(field.c_str(), nullptr, 10) : 0;
+    if (!digits || n < INT32_MIN || n > INT32_MAX) throw Error{"error: " + where + ": '" + field + "' is not an INT"};
     return intValue(n);
 }
 

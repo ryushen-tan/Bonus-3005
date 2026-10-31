@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
+#include <filesystem>
+#include <sys/stat.h>
 #include <unistd.h>
 
 constexpr int PAGE_SIZE = 4096;
@@ -28,11 +30,19 @@ struct DiskManager {
     ~DiskManager() { for (File& f : files) if (f.fd >= 0) ::close(f.fd); }
 
     [[noreturn]] static void fail(const std::string& what, const std::string& path) { throw Error{"io error: " + what + " " + path + ": " + std::strerror(errno)}; }
+    // only a file that exists, so a missing table file is an error rather than a new empty table
     uint32_t open(const std::string& path) {
-        int fd = ::open(path.c_str(), O_RDWR | O_CREAT, 0644);
+        int fd = ::open(path.c_str(), O_RDWR);
         if (fd < 0) fail("cannot open", path);
         off_t size = ::lseek(fd, 0, SEEK_END);
         files.push_back({path, fd, uint32_t(size / PAGE_SIZE)});
+        return uint32_t(files.size() - 1);
+    }
+    // a file that must not exist yet, so that creating one never overwrites another
+    uint32_t create(const std::string& path) {
+        int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL, 0644);
+        if (fd < 0) fail("cannot create", path);
+        files.push_back({path, fd, 0});
         return uint32_t(files.size() - 1);
     }
     uint32_t createTemp(const std::string& dir) {
@@ -42,10 +52,20 @@ struct DiskManager {
         files.push_back({path, fd, 0});
         return uint32_t(files.size() - 1);
     }
-    void remove(uint32_t file) {
+    void close(uint32_t file) {
         ::close(files[file].fd);
-        ::unlink(files[file].path.c_str());
         files[file].fd = -1;
+    }
+    void remove(uint32_t file) {
+        ::unlink(files[file].path.c_str());
+        close(file);
+    }
+    // rename(2) replaces the file at path in one step, so a reader finds the old file or the new one. The file
+    // renamed is a temporary one, which mkstemp made 0600, so it first gets the mode of every other file
+    void rename(uint32_t file, const std::string& path) {
+        if (::fchmod(files[file].fd, 0644) != 0) fail("cannot set the mode of", files[file].path);
+        if (::rename(files[file].path.c_str(), path.c_str()) != 0) fail("cannot rename " + files[file].path + " to", path);
+        files[file].path = path;
     }
     void truncate(uint32_t file, uint32_t pages) {
         if (::ftruncate(files[file].fd, off_t(pages) * PAGE_SIZE) != 0) fail("cannot resize", files[file].path);
@@ -56,9 +76,11 @@ struct DiskManager {
         if (attributed) (write ? attributed->writes : attributed->reads)++;
     }
     void readPage(PageId id, uint8_t* out) {
-        ssize_t n = ::pread(files[id.file].fd, out, PAGE_SIZE, off_t(id.page) * PAGE_SIZE);
-        if (n < 0) fail("cannot read", files[id.file].path);
-        std::memset(out + n, 0, PAGE_SIZE - size_t(n));
+        const File& file = files[id.file];
+        if (id.page >= file.pages) throw Error{"io error: " + file.path + " has " + std::to_string(file.pages) + " pages, there is no page " + std::to_string(id.page)};
+        ssize_t n = ::pread(file.fd, out, PAGE_SIZE, off_t(id.page) * PAGE_SIZE);
+        if (n < 0) fail("cannot read", file.path);
+        if (n != PAGE_SIZE) throw Error{"io error: " + file.path + " ends inside page " + std::to_string(id.page)};
         count(false);
     }
     void writePage(PageId id, const uint8_t* data) {
@@ -67,4 +89,19 @@ struct DiskManager {
     }
     uint32_t allocatePage(uint32_t file) { return files[file].pages++; }
     uint32_t numPages(uint32_t file) const { return files[file].pages; }
+};
+
+inline void createDirectories(const std::string& dir) {
+    std::error_code failure;
+    std::filesystem::create_directories(dir, failure);
+    if (failure) throw Error{"io error: cannot create directory " + dir + ": " + failure.message()};
+}
+
+// a scratch file that is deleted however the code holding it exits
+struct TempFile {
+    DiskManager& disk;
+    uint32_t file;
+    TempFile(DiskManager& d, const std::string& dir) : disk(d), file(d.createTemp(dir)) {}
+    TempFile(const TempFile&) = delete;
+    ~TempFile() { disk.remove(file); }
 };

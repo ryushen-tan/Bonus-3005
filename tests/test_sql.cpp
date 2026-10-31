@@ -22,6 +22,21 @@ void setup() {
     db.createTable("Loc", parseSchema("lid:INT,pid:INT,place:VARCHAR(20)"));
 }
 
+// n comparisons, name = 0 op name = 1 op ...
+std::string chain(const std::string& name, const std::string& op, int n) {
+    std::string s;
+    for (int i = 0; i < n; i++) s += (i ? " " + op + " " : "") + name + " = " + std::to_string(i);
+    return s;
+}
+std::string repeated(const std::string& s, int n) { std::string out; for (int i = 0; i < n; i++) out += s; return out; }
+std::string nestedSubqueries(int n) {
+    std::string q = "SELECT did FROM Emp";
+    for (int i = 0; i < n; i++) q = "SELECT s" + std::to_string(i) + ".did FROM (" + q + ") AS s" + std::to_string(i);
+    return q + ";";
+}
+// the column just after the text before it, ending an error line
+std::string columnAfter(const std::string& before) { return std::to_string(before.size() + 1) + "\n"; }
+
 struct Case { const char* name; std::string sql; std::string want; bool json = false; };
 const std::vector<Case> CASES = {
     {"5.1 plain filter and projection", "SELECT name, age FROM Emp WHERE age > 30;",
@@ -87,12 +102,13 @@ const std::vector<Case> CASES = {
     {"an aggregate only in HAVING", "SELECT did FROM Emp GROUP BY did HAVING AVG(age) > 30 AND did <> 2;",
      "project [Emp.did]\n  select avg_Emp_age > 30 and Emp.did != 2\n    group_by keys [Emp.did] aggregates [avg(Emp.age) as avg_Emp_age]\n      scan Emp\n"},
     {"HAVING on a column that is not grouped", "SELECT did FROM Emp GROUP BY did HAVING age > 3;", "error: aggregate: column Emp.age must appear in GROUP BY or be used in an aggregate function at line 1, column 41\n"},
-    {"SUM of a VARCHAR", "SELECT SUM(name) FROM Emp;", "error: type: SUM needs an INT column, Emp.name is VARCHAR(20) at line 1, column 8\n"},
+    {"SUM of a VARCHAR", "SELECT SUM(name) FROM Emp;", "error: type: SUM needs a number, Emp.name is VARCHAR(20) at line 1, column 8\n"},
     {"comparing two columns of different types", "SELECT * FROM Emp e JOIN Dept d ON e.name = d.did;", "error: type: cannot compare e.name (VARCHAR(20)) with d.did (INT) at line 1, column 43\n"},
     {"a UNION with different numbers of columns", "SELECT city FROM Emp UNION SELECT city, did FROM Dept;", "error: schema: the inputs of UNION have 1 and 2 columns at line 1, column 28\n"},
     {"a subquery in FROM needs an alias", "SELECT * FROM (SELECT did FROM Emp);", "error: syntax: expected an alias, which a subquery in FROM must have but found ';' at line 1, column 36\n"},
     {"lexical errors", "SELECT name FROM Emp WHERE city = 'Ott;", "error: lexical: unterminated string at line 1, column 35\n"},
     {"lexical errors", "SELECT name FROM Emp WHERE age > 3 # 4;", "error: lexical: unexpected character '#' at line 1, column 36\n"},
+    {"lexical errors", "SELECT name FROM Emp\nWHERE city = 'caf\xe9';", "error: lexical: the text is not valid UTF-8 at line 2, column 18\n"},
     {"syntax errors carry the position", "SELECT name\nFROM Emp\nWHERE age > ;", "error: syntax: expected a column, a number or a string but found ';' at line 3, column 13\n"},
     {"comments and a doubled quote", "-- every employee called O'Brien\nSELECT name FROM Emp WHERE name = 'O''Brien'; -- done",
      "project [Emp.name]\n  select Emp.name = 'O''Brien'\n    scan Emp\n"},
@@ -102,6 +118,77 @@ const std::vector<Case> CASES = {
     {"INSERT with a value of the wrong type", "INSERT INTO Dept VALUES (1, 'a', 'b', 'c');", "error: type: column budget is INT but the value 'b' is a string at line 1, column 34\n"},
     {"INSERT with a string too long", "CREATE TABLE P (k VARCHAR(2)); INSERT INTO P VALUES ('abc');", "error: type: 'abc' is longer than VARCHAR(2) at line 1, column 54\n"},
     {"CREATE of a table that exists", "CREATE TABLE Emp (a INT);", "error: name: table Emp already exists at line 1, column 1\n"},
+
+    // long and deep statements
+    {"a chain of 1000 ORs is one level of nesting", "SELECT COUNT(*) FROM Emp WHERE " + chain("eid", "OR", 1000) + ";",
+     "project [count_star]\n  group_by keys [] aggregates [count(*) as count_star]\n    select " + chain("Emp.eid", "or", 1000) + "\n      scan Emp\n"},
+    {"a chain of 1000 ANDs is one level of nesting", "SELECT eid FROM Emp WHERE " + chain("eid", "AND", 1000) + ";",
+     "project [Emp.eid]\n  select " + chain("Emp.eid", "and", 1000) + "\n    scan Emp\n"},
+    {"8000 ORs are an error, not a crash", "SELECT COUNT(*) FROM Emp WHERE " + chain("eid", "OR", 8000) + ";",
+     "error: syntax: a condition may hold at most 1000 comparisons at line 1, column " + columnAfter("SELECT COUNT(*) FROM Emp WHERE " + chain("eid", "OR", 1000) + " OR eid ")},
+    {"each condition has its own count of comparisons", "SELECT did FROM Emp WHERE " + chain("eid", "OR", 1000) + " GROUP BY did HAVING " + chain("did", "OR", 1000) + ";",
+     "project [Emp.did]\n  select " + chain("Emp.did", "or", 1000) + "\n    group_by keys [Emp.did] aggregates []\n      select " + chain("Emp.eid", "or", 1000) + "\n        scan Emp\n"},
+    {"449 NOTs and a parenthesis around 1000 comparisons", "SELECT eid FROM Emp WHERE " + repeated("NOT ", 449) + "(" + chain("eid", "OR", 1000) + ");",
+     "project [Emp.eid]\n  select " + repeated("not ", 449) + "(" + chain("Emp.eid", "or", 1000) + ")\n    scan Emp\n"},
+    {"451 NOTs are too deep", "SELECT eid FROM Emp WHERE " + repeated("NOT ", 451) + "eid = 1;",
+     "error: syntax: nesting too deep, at most 450 levels of parentheses, NOT and subqueries at line 1, column " + columnAfter("SELECT eid FROM Emp WHERE " + repeated("NOT ", 451))},
+    {"450 parentheses around a condition", "SELECT eid FROM Emp WHERE " + repeated("(", 450) + "eid = 1" + repeated(")", 450) + ";", "project [Emp.eid]\n  select Emp.eid = 1\n    scan Emp\n"},
+    {"450 parentheses around a query", repeated("(", 450) + "SELECT eid FROM Emp" + repeated(")", 450) + ";", "project [Emp.eid]\n  scan Emp\n"},
+    {"451 nested subqueries are too deep", nestedSubqueries(451),
+     "error: syntax: nesting too deep, at most 450 levels of parentheses, NOT and subqueries at line 1, column " + columnAfter(nestedSubqueries(451).substr(0, nestedSubqueries(451).find("SELECT did FROM Emp")))},
+    {"1001 set operators are an error, not a crash", "SELECT did FROM Emp" + repeated(" UNION ALL SELECT did FROM Emp", 1001) + ";",
+     "error: syntax: a statement may hold at most 1000 set operators at line 1, column " + columnAfter("SELECT did FROM Emp" + repeated(" UNION ALL SELECT did FROM Emp", 1000) + " ")},
+
+    // names
+    {"an alias that another column has as its name, and ORDER BY that column", "SELECT d.did AS budget FROM Dept d ORDER BY d.budget;",
+     "project [budget]\n  sort [d.budget asc]\n    project [d.did as budget, d.budget]\n      rename d\n        scan Dept\n"},
+    {"ORDER BY the source of an aliased column sorts by the alias", "SELECT e.name AS title FROM Emp e JOIN Dept d ON e.did = d.did ORDER BY d.title, e.name;",
+     "project [title]\n  sort [d.title asc, title asc]\n    project [e.name as title, d.title]\n      join e.did = d.did\n        rename e\n          scan Emp\n        rename d\n          scan Dept\n"},
+    {"an aggregate named like a group column, used in HAVING", "SELECT did, COUNT(*) AS did FROM Emp GROUP BY did HAVING COUNT(*) > 100;",
+     "project [Emp.did, did]\n  select did > 100\n    group_by keys [Emp.did] aggregates [count(*) as did]\n      scan Emp\n"},
+    {"ORDER BY a name two output columns have", "SELECT name AS age, age FROM Emp ORDER BY age;",
+     "error: ambiguity: ORDER BY age is ambiguous, two columns of the select list are named age at line 1, column 43\n"},
+    {"ORDER BY an output column name before the FROM scope", "SELECT e.did AS x, d.did FROM Emp e, Dept d ORDER BY did;",
+     "sort [d.did asc]\n  project [e.did as x, d.did]\n    cross\n      rename e\n        scan Emp\n      rename d\n        scan Dept\n"},
+    {"a column selected twice is renamed the second time", "SELECT name, name FROM Emp ORDER BY name;",
+     "sort [Emp.name asc]\n  project [Emp.name, Emp.name as name_2]\n    scan Emp\n"},
+    {"an aggregate selected twice is computed once", "SELECT COUNT(*), COUNT(*) FROM Emp;",
+     "project [count_star, count_star as count_star_2]\n  group_by keys [] aggregates [count(*) as count_star]\n    scan Emp\n"},
+    {"an aggregate again without its alias", "SELECT MAX(age) AS m, MAX(age) FROM Emp;", "project [m, m as m_2]\n  group_by keys [] aggregates [max(Emp.age) as m]\n    scan Emp\n"},
+    {"a default aggregate name an alias has", "SELECT did AS count_star, COUNT(*) FROM Emp GROUP BY did ORDER BY count_star;",
+     "sort [count_star asc]\n  project [Emp.did as count_star, count_star_2]\n    group_by keys [Emp.did] aggregates [count(*) as count_star_2]\n      scan Emp\n"},
+    {"two aliases alike are ambiguous in ORDER BY", "SELECT name AS x, city AS x FROM Emp ORDER BY x;",
+     "error: ambiguity: ORDER BY x is ambiguous, two columns of the select list are named x at line 1, column 47\n"},
+    {"a subquery with two columns of one name", "SELECT * FROM (SELECT e.did, d.did FROM Emp e, Dept d) AS s;",
+     "project [s.did, s.did_2]\n  rename s\n    project [e.did, d.did as did_2]\n      project [e.did, d.did]\n        cross\n          rename e\n            scan Emp\n          rename d\n            scan Dept\n"},
+    {"DISTINCT with ORDER BY the source of an aliased column", "SELECT DISTINCT city AS c FROM Emp ORDER BY city;",
+     "sort [c asc]\n  distinct\n    project [Emp.city as c]\n      scan Emp\n"},
+    {"an ON condition sees only its own JOIN chain", "SELECT * FROM Dept d, Emp e JOIN Proj p ON d.did = p.did;",
+     "error: name: d is not part of this JOIN, so its ON condition cannot use d.did at line 1, column 44\n"},
+    {"a column of an earlier comma item is unknown in ON", "SELECT * FROM Dept d, Emp e JOIN Proj p ON budget = p.did;", "error: name: unknown column budget at line 1, column 44\n"},
+    {"ORDER BY after a set operation takes no table name", "SELECT e.name FROM Emp e UNION SELECT d.title FROM Dept d ORDER BY e.name;",
+     "error: name: ORDER BY after a set operation can only name the result's columns at line 1, column 68\n"},
+
+    // grouping and types
+    {"GROUP BY an output alias", "SELECT did AS dd, COUNT(*) FROM Emp GROUP BY dd;", "project [Emp.did as dd, count_star]\n  group_by keys [Emp.did] aggregates [count(*) as count_star]\n    scan Emp\n"},
+    {"GROUP BY a FROM column before an alias", "SELECT age AS did, COUNT(*) FROM Emp GROUP BY did;",
+     "error: aggregate: column Emp.age must appear in GROUP BY or be used in an aggregate function at line 1, column 8\n"},
+    {"GROUP BY the alias of an aggregate", "SELECT COUNT(*) AS n FROM Emp GROUP BY n;",
+     "error: aggregate: GROUP BY n names COUNT(*), and aggregate functions are not allowed in GROUP BY at line 1, column 40\n"},
+    {"a column grouped twice is one key", "SELECT did, COUNT(*) FROM Emp GROUP BY did, did;", "project [Emp.did, count_star]\n  group_by keys [Emp.did] aggregates [count(*) as count_star]\n    scan Emp\n"},
+    {"SUM and AVG of a SUM and an AVG", "SELECT SUM(t.s), AVG(t.s), SUM(t.a), AVG(t.a) FROM (SELECT did, SUM(age) AS s, AVG(age) AS a FROM Emp GROUP BY did) AS t;",
+     "project [sum_t_s, avg_t_s, sum_t_a, avg_t_a]\n  group_by keys [] aggregates [sum(t.s) as sum_t_s, avg(t.s) as avg_t_s, sum(t.a) as sum_t_a, avg(t.a) as avg_t_a]\n    rename t\n"
+     "      project [Emp.did, s, a]\n        group_by keys [Emp.did] aggregates [sum(Emp.age) as s, avg(Emp.age) as a]\n          scan Emp\n"},
+    {"an integer may have a plus sign", "SELECT name FROM Emp WHERE age > +1; INSERT INTO Proj VALUES (+2, -3, 'x');",
+     "project [Emp.name]\n  select Emp.age > 1\n    scan Emp\n{\"statement\":\"insert\",\"table\":\"Proj\",\"values\":[2,-3,\"x\"]}\n"},
+    {"an integer too big for an INT says why", "SELECT name FROM Emp WHERE age < 3000000000;",
+     "error: type: 3000000000 does not fit in an INT, which has 4 bytes and holds -2147483648 to 2147483647 at line 1, column 34\n"},
+
+    // LIMIT inside a set operation and a subquery
+    {"LIMIT in a parenthesised set operand", "SELECT title FROM Dept UNION ALL (SELECT name FROM Emp ORDER BY name LIMIT 2);",
+     "union_all\n  project [Dept.title]\n    scan Dept\n  limit 2\n    sort [Emp.name asc]\n      project [Emp.name]\n        scan Emp\n"},
+    {"LIMIT in a subquery in FROM", "SELECT s.did, d.title FROM (SELECT did FROM Emp ORDER BY did DESC LIMIT 2) AS s JOIN Dept d ON s.did = d.did;",
+     "project [s.did, d.title]\n  join s.did = d.did\n    rename s\n      limit 2\n        sort [Emp.did desc]\n          project [Emp.did]\n            scan Emp\n    rename d\n      scan Dept\n"},
 };
 
 int main() {

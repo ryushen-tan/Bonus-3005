@@ -2,14 +2,14 @@
 
 | trace | accesses | distinct pages | B | LRU hits | LRU hit rate | CLOCK hits | CLOCK hit rate |
 |---|---|---|---|---|---|---|---|
-| 1 uniform over 200 pages | 1000 | 199 | 4 | 0 | 0.000 | 0 | 0.000 |
-| 1 uniform over 200 pages | 1000 | 199 | 16 | 81 | 0.081 | 80 | 0.080 |
-| 1 uniform over 200 pages | 1000 | 199 | 64 | 302 | 0.302 | 296 | 0.296 |
-| 1 uniform over 200 pages | 1000 | 199 | 256 | 801 | 0.801 | 801 | 0.801 |
-| 2 80/20 skew over 200 pages | 1000 | 94 | 4 | 118 | 0.118 | 103 | 0.103 |
-| 2 80/20 skew over 200 pages | 1000 | 94 | 16 | 455 | 0.455 | 440 | 0.440 |
-| 2 80/20 skew over 200 pages | 1000 | 94 | 64 | 862 | 0.862 | 857 | 0.857 |
-| 2 80/20 skew over 200 pages | 1000 | 94 | 256 | 906 | 0.906 | 906 | 0.906 |
+| 1 uniform over 200 pages | 1000 | 198 | 4 | 20 | 0.020 | 21 | 0.021 |
+| 1 uniform over 200 pages | 1000 | 198 | 16 | 73 | 0.073 | 71 | 0.071 |
+| 1 uniform over 200 pages | 1000 | 198 | 64 | 297 | 0.297 | 296 | 0.296 |
+| 1 uniform over 200 pages | 1000 | 198 | 256 | 802 | 0.802 | 802 | 0.802 |
+| 2 80/20 skew over 200 pages | 1000 | 158 | 4 | 50 | 0.050 | 49 | 0.049 |
+| 2 80/20 skew over 200 pages | 1000 | 158 | 16 | 243 | 0.243 | 234 | 0.234 |
+| 2 80/20 skew over 200 pages | 1000 | 158 | 64 | 745 | 0.745 | 715 | 0.715 |
+| 2 80/20 skew over 200 pages | 1000 | 158 | 256 | 842 | 0.842 | 842 | 0.842 |
 | 3 sequential scan of 80 pages, ten times | 800 | 80 | 4 | 0 | 0.000 | 0 | 0.000 |
 | 3 sequential scan of 80 pages, ten times | 800 | 80 | 16 | 0 | 0.000 | 0 | 0.000 |
 | 3 sequential scan of 80 pages, ten times | 800 | 80 | 64 | 0 | 0.000 | 0 | 0.000 |

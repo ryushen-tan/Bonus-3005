@@ -10,6 +10,14 @@ A database is a directory: `catalog.db` plus one `<table>.db` per table. Every f
 disk manager's index of the open file, the page is the zero-based page number inside it, which is the
 page id the module document talks about. Every multi-byte integer is little-endian.
 
+A table's file is made only when the table is created (`storage create-table` or SQL's CREATE TABLE),
+and never over a file that is already there. Everything else opens a file only if it exists, so a
+missing `R.db` is an error, not a new empty table. Reading a page past the end of a file is an error
+too, so a file cut short cannot be read as zeros. Likewise only `create-table` (and the shell) makes a
+new database: `load`, `scan` and `layout` on a directory without a `catalog.db` say it is not a
+database. The `storage` tool reports every error on one line with exit status 1, and an exception that
+is not one of the engine's own errors as `internal error: ...`, never by aborting.
+
 The disk manager counts one read per `readPage` and one write per `writePage`, in a total and, when the
 executor has set it, in the counters of the operator that is running (Module 2 uses that to charge each
 operator for its own temporary files). `allocatePage` only advances the file's page count; the page
@@ -19,7 +27,9 @@ reaches the disk when the buffer pool writes it.
 
 The fields in schema order, nothing else. INT is 4 bytes two's complement, VARCHAR(n) is a 2 byte length
 L then L bytes. The executor also writes a REAL (only the output of AVG) as the 8 bytes of a double into
-its own temporary files; a table can never have one.
+its own temporary files; a table can never have one. Decoding checks each field against the record's
+length, so a record shorter than its schema says, which only a damaged file can hold, is the error
+`corrupt record` rather than a read past its end.
 
 The real record `(42, 'bob', 7)` of table `R(a INT, b VARCHAR(20), c INT)`, read from the file with `xxd`:
 
@@ -55,7 +65,12 @@ These are the three inserts of the worked example in section 3.2 (13, 20 and 13 
 
 A slot whose offset is 0 is dead. Offset 0 can never be a live record because the header is there.
 Slots are never reused or renumbered, so a rid stays valid for as long as its record lives, and
-reading a dead or missing slot is an error naming the rid.
+reading a dead or missing slot is an error naming the rid. A rid's slot is compared as the unsigned
+number it is, so a slot of 2^31 or more is missing, not negative. `get` and `remove` first find the
+rid's page in the directory, so a rid on a page the directory does not list, a directory page above all,
+is `no record at rid (0, 0), page 0 is not a data page of table R` instead of a directory page read
+or overwritten as data. For a table of up to 681 data pages that is one directory page and the data
+page, the two page accesses the module allows.
 
 ### Compaction: not implemented
 
@@ -88,6 +103,17 @@ entries it first allocates a new directory page and links it from `next_dir_page
 data pages share the file's page numbers, so in a large table they interleave (the second directory page
 of a 700 page table is page 682). The test `a second directory page after 681 data pages` loads 700
 data pages and checks the chain, the count and that a scan returns every record in insert order.
+
+A directory page is allocated when the chain grows, after every page already in the file, so
+`next_dir_page` always points forward. Every walk of the chain (insert, scan, `get`, `remove` and
+`layout`) checks that, so a chain that points back, as page 0 of a file of zeros points at itself, is
+`corrupt table file R.db: directory page 0 links back to page 0` rather than an endless loop.
+
+A record of more than 4084 bytes (4088 less its slot) is refused by the insert before any page is
+touched, with `table R: a record of 4085 bytes does not fit on a page (at most 4084)`; the loader checks
+every row before inserting any, so its message names the row as well. An insert holds its directory page
+and its data page pinned together, as the module describes it, so `load` and `create-table` need
+B ≥ 2 and stop with `no unpinned frame available` at B = 1.
 
 First fit means a small record can go back into an early page that a large record could not fit into.
 That is the reason for the directory, and it is why the measured tuples per page in REPORT_M1.md can
@@ -134,6 +160,10 @@ Evicting a pinned page cannot happen: neither policy will choose a frame with a 
 no unpinned frame `fetch` fails with `no unpinned frame available`. Unpinning a page that is not
 resident, or whose pin count is already 0, is an error. Both have tests, under both policies.
 
+A pool needs at least one frame. Every tool's `--frames` B becomes the size of a pool, so the pool's
+constructor is the one place that checks it, with one message, `--frames must be at least 1`. CLOCK is
+the default policy, for the reasons in section 2 of REPORT_M1.md; `--policy lru` selects LRU.
+
 Two additions that the later modules need:
 
 - `reserve()` takes a frame out of the pool as working memory for an operator (the run buffer of a
@@ -163,7 +193,15 @@ every record is its kind:
 Kinds 3 to 5 are the room the module document asks to leave for Module 4. Values of either type are
 stored as their text, because a column's minimum may be an INT or a VARCHAR, and are turned back into
 values using the column's type when the catalog is read. Splitting statistics into one record per bucket
-keeps every record far below the 4088 byte limit for any bucket count.
+keeps every record far below the 4084 byte limit for any bucket count.
+
+A table's name is also its file's name, so `create-table`, from the storage tool or SQL alike, takes only
+an identifier (a letter or underscore, then letters, digits and underscores) of at most 252 characters,
+which leaves room for `.db` in the 255 bytes a file name may have. It refuses `catalog` in any case,
+the name of the catalog's own file, and a name equal to an existing table's when case is ignored,
+because on a file system that ignores case, as macOS's does, the two tables would share one file. A
+column name may have at most 255 characters, the VARCHAR(255) the catalog stores it in, so every
+catalog record fits on a page.
 
 The real first records of a catalog with one table, from the dump of `catalog.db`, end of page 1:
 
@@ -172,18 +210,24 @@ The real first records of a catalog with one table, from the dump of `catalog.db
 kind 1       "R"       "R.db"             1 data page   3 tuples
 ```
 
-When the catalog changes (create-table, load, ANALYZE) it is rewritten whole: the pool forgets its
-pages, the file is truncated, and the records are inserted again and flushed. The catalog is small, the
-rewrite is deterministic, and it means running ANALYZE twice produces a byte-identical `catalog.db`.
+When the catalog changes (create-table, load, ANALYZE, an INSERT in the shell) it is written whole to a
+new temporary file in the database directory, flushed, and renamed over `catalog.db`. A rename replaces
+the file in one step, so a process killed at any moment leaves the old catalog or the new one, never
+part of either. A save that fails deletes its temporary file, and a `create-table` whose save fails also
+deletes the table file it made, so the name can be used again. The catalog is small, the rewrite is
+deterministic, and it means running ANALYZE twice produces a byte-identical `catalog.db`.
 
 ## 7 Loading
 
 `storage load` reads the CSV file twice. The first pass checks every line: the number of fields, every
-INT parses and fits in 32 bits, every VARCHAR fits its length, and the encoded record fits on a page.
-The second pass inserts. So a file with a bad line 9000 loads nothing rather than 8999 rows, and the
-error names the line and the column (`line 2, column 1 (a): 'x' is not an INT`), or the table and row for
-a record over 4088 bytes. A field containing a comma is wrapped in double quotes, and inside quotes `""`
-is one quote, as in RFC 4180. A `\r` before the newline is dropped so files written on Windows load.
+INT is a number that fits in 32 bits (read by value, so `000000000001` and `+7` are INTs), every VARCHAR
+is well-formed UTF-8 and fits its length in bytes, and the encoded record fits on a page. The second
+pass inserts. So a file with a bad line 9000 loads nothing rather than 8999 rows, and the error names
+the line and the column (`line 2, column 1 (a): 'x' is not an INT`), or the table and row for a record
+over 4084 bytes. Bytes that are not UTF-8 are named by position, `line 2, column 2 (b): byte 2 is not
+valid UTF-8`, so the error does not repeat them, and whatever `load` stores `scan --json` prints as
+valid JSON. A field containing a comma is wrapped in double quotes, and inside quotes `""` is one
+quote, as in RFC 4180. A `\r` before the newline is dropped so files written on Windows load.
 
 ## 8 Sources and what they changed
 

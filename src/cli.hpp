@@ -53,8 +53,11 @@ inline std::string readFile(const std::string& path) {
     if (!f || std::filesystem::is_directory(path)) throw Error{"io error: cannot open " + path};
     return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
 }
-inline std::unique_ptr<Database> openDatabase(const std::string& dir, int frames, Policy policy = Lru) {
-    if (!std::filesystem::exists(dir + "/catalog.db")) throw Error{"error: " + dir + " is not a database, it has no catalog.db"};
+inline std::unique_ptr<Database> openDatabase(const std::string& dir, int frames, Policy policy = Clock) {
+    std::error_code failure;
+    bool exists = std::filesystem::exists(dir + "/catalog.db", failure);
+    if (failure) throw Error{"io error: cannot open " + dir + ": " + failure.message()};
+    if (!exists) throw Error{"error: " + dir + " is not a database, it has no catalog.db"};
     return std::make_unique<Database>(dir, frames, policy);
 }
 inline Policy policyNamed(const std::string& name) {

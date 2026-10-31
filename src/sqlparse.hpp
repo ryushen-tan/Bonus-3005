@@ -2,6 +2,7 @@
 // a printer for the tree
 #pragma once
 #include "lexer.hpp"
+#include <algorithm>
 #include <memory>
 #include <ostream>
 #include <set>
@@ -21,6 +22,12 @@ inline std::string upper(std::string s) { for (char& c : s) c = char(std::touppe
 
 // keywords in any case come out upper case; identifiers keep their case
 inline std::vector<SqlToken> sqlTokens(const std::string& s) {
+    if (size_t bad = invalidUtf8At(s); bad != std::string::npos) {
+        size_t lineStart = s.rfind('\n', bad);
+        int badLine = 1 + int(std::count(s.begin(), s.begin() + long(bad), '\n'));
+        int badCol = int(bad - (lineStart == std::string::npos ? 0 : lineStart + 1)) + 1;
+        throw SqlError{"lexical", "the text is not valid UTF-8", badLine, badCol};
+    }
     std::vector<SqlToken> out;
     int line = 1;
     size_t start = 0;
@@ -38,11 +45,12 @@ inline std::vector<SqlToken> sqlTokens(const std::string& s) {
             if (KEYWORDS.count(upper(word))) emit(KeywordToken, upper(word)); else emit(IdentifierToken, word);
             i = j;
         }
-        else if (dig(c) || (c == '-' && i + 1 < s.size() && dig(s[i + 1]))) {
+        else if (dig(c) || ((c == '-' || c == '+') && i + 1 < s.size() && dig(s[i + 1]))) {
             size_t j = i + 1;
             while (j < s.size() && dig(s[j])) j++;
             if (j < s.size() && wordChar(s[j])) throw SqlError{"lexical", "a number cannot run into a name: '" + s.substr(i, j - i + 1) + "'", line, col};
-            emit(IntegerToken, s.substr(i, j - i));
+            size_t numberStart = c == '+' ? i + 1 : i;
+            emit(IntegerToken, s.substr(numberStart, j - numberStart));
             i = j;
         }
         else if (c == '\'') {
@@ -73,6 +81,7 @@ inline std::string refText(const ColumnRef& c) { return c.qualifier.empty() ? c.
 struct AggCall { std::string func; bool star = false; ColumnRef column; int line = 0, col = 0; };
 inline std::string aggText(const AggCall& a) { return upper(a.func) + "(" + (a.star ? "*" : refText(a.column)) + ")"; }
 struct SqlOperand { enum { Column, Int, Str, Agg } kind; ColumnRef column; std::string literal; AggCall agg; int line = 0, col = 0; };
+// an Or or And holds every operand of its chain, so a long chain is one wide node and not a deep one
 struct Condition {
     enum { Or, And, Not, Compare } kind;
     std::string op;
@@ -81,7 +90,7 @@ struct Condition {
     int line = 0, col = 0;
 };
 struct SelectItem { bool isAgg = false; ColumnRef column; AggCall agg; std::string alias; int line = 0, col = 0; };
-struct OrderItem { bool isAgg = false; ColumnRef column; AggCall agg; bool desc = false; };
+struct OrderItem { bool isAgg = false; ColumnRef column; AggCall agg; bool desc = false; int line = 0, col = 0; };
 struct Query;
 struct TableRef { std::string table; std::shared_ptr<Query> sub; std::string alias; int line = 0, col = 0; };
 // one chain of JOIN ... ON; the chains of a FROM clause are separated by commas
@@ -115,10 +124,14 @@ struct Statement {
 
 // ---- the parser, one method per rule of GRAMMAR_SQL.md ----
 
+// the most a statement may hold, so that the recursive parts of the system stay within the stack: levels of
+// parentheses, NOT and subqueries together, comparisons in one condition, and set operators
+const int MAX_NESTING = 450, MAX_COMPARISONS = 1000, MAX_SET_OPERATORS = 1000;
+
 struct SqlParser {
     std::vector<SqlToken> toks;
     size_t p = 0;
-    int depth = 0;
+    int depth = 0, comparisons = 0, setOperators = 0;
     const SqlToken& cur() const { return toks[p]; }
     SqlToken take() { return toks[p++]; }
     bool at(const std::string& text) const { return (cur().kind == KeywordToken || cur().kind == PunctToken || cur().kind == OperatorToken) && cur().text == text; }
@@ -134,7 +147,7 @@ struct SqlParser {
     [[noreturn]] void fail(const std::string& what) { throw SqlError{"syntax", "expected " + what + " but found " + shown(cur()), cur().line, cur().col}; }
     SqlToken expect(const std::string& text) { if (!at(text)) fail(text.size() == 1 ? "'" + text + "'" : text); return take(); }
     SqlToken ident(const std::string& what) { if (cur().kind != IdentifierToken) fail(what); return take(); }
-    void enter() { if (++depth > 200) throw SqlError{"syntax", "nesting too deep", cur().line, cur().col}; }
+    void enter() { if (++depth > MAX_NESTING) throw SqlError{"syntax", "nesting too deep, at most " + std::to_string(MAX_NESTING) + " levels of parentheses, NOT and subqueries", cur().line, cur().col}; }
 
     std::vector<Statement> script() {
         std::vector<Statement> out;
@@ -148,6 +161,7 @@ struct SqlParser {
     Statement statement() {
         Statement s;
         s.line = cur().line; s.col = cur().col;
+        setOperators = 0;
         if (accept("CREATE")) {
             s.kind = Statement::Create;
             expect("TABLE");
@@ -194,11 +208,13 @@ struct SqlParser {
         q->line = cur().line; q->col = cur().col;
         q->terms.push_back(term());
         for (;;) {
+            SqlToken t = cur();
             std::string op;
             if (accept("UNION")) op = accept("ALL") ? "union_all" : "union";
             else if (accept("INTERSECT")) op = "intersect";
             else if (accept("EXCEPT")) op = "except";
             else break;
+            if (++setOperators > MAX_SET_OPERATORS) throw SqlError{"syntax", "a statement may hold at most " + std::to_string(MAX_SET_OPERATORS) + " set operators", t.line, t.col};
             q->ops.push_back(op);
             q->terms.push_back(term());
         }
@@ -206,6 +222,7 @@ struct SqlParser {
             expect("BY");
             do {
                 OrderItem o;
+                o.line = cur().line; o.col = cur().col;
                 if (aggregateStart()) { o.isAgg = true; o.agg = aggregate(); } else o.column = column();
                 if (accept("DESC")) o.desc = true; else accept("ASC");
                 q->orderBy.push_back(o);
@@ -232,12 +249,12 @@ struct SqlParser {
         else do b->items.push_back(selectItem()); while (accept(","));
         expect("FROM");
         do b->from.push_back(joinChain()); while (accept(","));
-        if (accept("WHERE")) b->where = std::make_unique<Condition>(condition());
+        if (accept("WHERE")) b->where = std::make_unique<Condition>(clause());
         if (accept("GROUP")) {
             expect("BY");
             b->grouped = true;
             do b->groupBy.push_back(column()); while (accept(","));
-            if (accept("HAVING")) b->having = std::make_unique<Condition>(condition());
+            if (accept("HAVING")) b->having = std::make_unique<Condition>(clause());
         }
         return b;
     }
@@ -275,7 +292,7 @@ struct SqlParser {
             else if (!accept("JOIN")) return chain;
             chain.refs.push_back(tableRef());
             expect("ON");
-            chain.on.push_back(condition());
+            chain.on.push_back(clause());
         }
     }
     TableRef tableRef() {
@@ -295,30 +312,24 @@ struct SqlParser {
         else if (cur().kind == IdentifierToken) r.alias = take().text;
         return r;
     }
+    // a whole WHERE, HAVING or ON condition
+    Condition clause() { comparisons = 0; return condition(); }
     // NOT binds tighter than AND, AND tighter than OR, both left associative
     Condition condition() {
-        Condition c = conjunction();
-        while (at("OR")) {
-            SqlToken t = take();
-            Condition r = conjunction();
-            Condition both{Condition::Or, "", {}, {}, {}, t.line, t.col};
-            both.kids.push_back(std::move(c));
-            both.kids.push_back(std::move(r));
-            c = std::move(both);
-        }
-        return c;
+        Condition first = conjunction();
+        if (!at("OR")) return first;
+        Condition chain{Condition::Or, "", {}, {}, {}, cur().line, cur().col};
+        chain.kids.push_back(std::move(first));
+        while (accept("OR")) chain.kids.push_back(conjunction());
+        return chain;
     }
     Condition conjunction() {
-        Condition c = negation();
-        while (at("AND")) {
-            SqlToken t = take();
-            Condition r = negation();
-            Condition both{Condition::And, "", {}, {}, {}, t.line, t.col};
-            both.kids.push_back(std::move(c));
-            both.kids.push_back(std::move(r));
-            c = std::move(both);
-        }
-        return c;
+        Condition first = negation();
+        if (!at("AND")) return first;
+        Condition chain{Condition::And, "", {}, {}, {}, cur().line, cur().col};
+        chain.kids.push_back(std::move(first));
+        while (accept("AND")) chain.kids.push_back(negation());
+        return chain;
     }
     Condition negation() {
         if (at("NOT")) {
@@ -333,6 +344,7 @@ struct SqlParser {
         Condition c{Condition::Compare, "", {}, operand(), {}, 0, 0};
         if (cur().kind != OperatorToken) fail("a comparison operator");
         SqlToken op = take();
+        if (++comparisons > MAX_COMPARISONS) throw SqlError{"syntax", "a condition may hold at most " + std::to_string(MAX_COMPARISONS) + " comparisons", op.line, op.col};
         c.op = op.text; c.line = op.line; c.col = op.col;
         c.right = operand();
         return c;
@@ -365,7 +377,7 @@ inline std::string conditionSql(const Condition& c, int outer = 0) {
     std::string s;
     if (c.kind == Condition::Compare) s = operandSql(c.left) + " " + c.op + " " + operandSql(c.right);
     else if (c.kind == Condition::Not) s = "NOT " + conditionSql(c.kids[0], 3);
-    else s = conditionSql(c.kids[0], level) + (c.kind == Condition::Or ? " OR " : " AND ") + conditionSql(c.kids[1], level + 1);
+    else for (size_t k = 0; k < c.kids.size(); k++) s += (k == 0 ? "" : c.kind == Condition::Or ? " OR " : " AND ") + conditionSql(c.kids[k], level + 1);
     return level < outer ? "(" + s + ")" : s;
 }
 inline void printQuery(const Query& q, std::ostream& out, int depth);

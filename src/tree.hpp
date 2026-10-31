@@ -12,14 +12,23 @@ enum Kind { Relation, Union, Intersect, Minus, Times, Distinct, Select, Project,
 const char* const NAME[] = {"Relation", "Union", "Intersect", "Minus", "Times", "Distinct", "Select", "Project", "Rename", "Join", "List", "And", "Or", "Not", "Eq", "Ne", "Lt", "Le", "Gt", "Ge", "Attr", "Num", "Str"};
 const char* const SYMBOL[] = {"", "", "", "", "", "", "", "", "", "", "", "and", "or", "not", "=", "!=", "<", "<=", ">", ">="};
 
-struct Node { Kind kind; Value val; size_t idx = 0; int line = 0, col = 0, depth = 1; std::vector<Node> kids; };
+// depth counts nesting, in which a chain of ands or of ors is one level however long; height counts every level
+struct Node { Kind kind; Value val; size_t idx = 0; int line = 0, col = 0, depth = 1, height = 1; std::vector<Node> kids; };
 
-// builds a node, refuses trees deeper than 500 so evaluation can't overflow the stack
+const int MAX_DEPTH = 500, MAX_HEIGHT = 2000;
+
+// builds a node, refuses trees nested deeper than MAX_DEPTH or taller than MAX_HEIGHT so that nothing walking
+// them, evaluation or Module 4 placing each conjunct of a chain, can overflow the stack
 template <class... K> Node mk(Kind k, const Token& t, K... kids) {
-    Node n{k, {t.kind == Num, t.kind == Num ? toNum(t.text, t.line, t.col) : 0, t.text}, 0, t.line, t.col, 1, {}};
+    Node n{k, {t.kind == Num, t.kind == Num ? toNum(t.text, t.line, t.col) : 0, t.text}, 0, t.line, t.col, 1, 1, {}};
     (n.kids.push_back(std::move(kids)), ...);
-    for (const Node& kid : n.kids) n.depth = std::max(n.depth, kid.depth + 1);
-    if (n.depth > 500) throw Error{"syntax error: nesting too deep", t.line, t.col};
+    for (size_t i = 0; i < n.kids.size(); i++) {
+        bool chained = i == 0 && (k == And || k == Or) && n.kids[i].kind == k;
+        n.depth = std::max(n.depth, n.kids[i].depth + (chained ? 0 : 1));
+        n.height = std::max(n.height, n.kids[i].height + 1);
+    }
+    if (n.depth > MAX_DEPTH) throw Error{"syntax error: nesting too deep", t.line, t.col};
+    if (n.height > MAX_HEIGHT) throw Error{"syntax error: condition too long", t.line, t.col};
     return n;
 }
 

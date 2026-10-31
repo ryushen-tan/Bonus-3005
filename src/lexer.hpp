@@ -5,6 +5,27 @@
 #include <string>
 #include <vector>
 
+// the position of the first byte that does not begin well-formed UTF-8 (RFC 3629: no overlong forms, no
+// surrogates, nothing past U+10FFFF), or npos
+inline size_t invalidUtf8At(const std::string& text) {
+    for (size_t i = 0; i < text.size();) {
+        unsigned char lead = (unsigned char)text[i];
+        if (lead < 0x80) { i++; continue; }
+        size_t length = lead >= 0xC2 && lead <= 0xDF ? 2 : lead >= 0xE0 && lead <= 0xEF ? 3 : lead >= 0xF0 && lead <= 0xF4 ? 4 : 0;
+        if (length == 0 || i + length > text.size()) return i;
+        unsigned code = lead & (0x7F >> length);
+        for (size_t k = 1; k < length; k++) {
+            unsigned char next = (unsigned char)text[i + k];
+            if ((next & 0xC0) != 0x80) return i;
+            code = code << 6 | (next & 0x3F);
+        }
+        unsigned smallest = length == 2 ? 0x80 : length == 3 ? 0x800 : 0x10000;
+        if (code < smallest || (code >= 0xD800 && code <= 0xDFFF) || code > 0x10FFFF) return i;
+        i += length;
+    }
+    return std::string::npos;
+}
+
 struct Error { std::string msg; int line = 0, col = 0; };
 
 enum Tok { Word, Num, Str, Sym, End };

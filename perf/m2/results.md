@@ -93,9 +93,8 @@ Varying the size of both relations with B = 16 fixed:
 Sort of Twenty, 82 data pages, at B = 4 (20 x B = 80): 6600 tuples out, peak frames 4.
 
 ```
-sort              tuples_out=6600     comparisons=82556       reads=236     writes=236    passes=4
-  seqscan Twenty  tuples_out=6600     comparisons=0           reads=83      writes=0      
-total: tuples_out=6600 comparisons=82556 reads=319 writes=236 peak_frames=4
+sort tuples_out=6600 comparisons=82556 reads=236 writes=236 passes=4
+  seqscan Twenty tuples_out=6600 comparisons=0 reads=83 writes=0
 ```
 
 ## 6 What materialising an input costs
@@ -105,20 +104,34 @@ A hash group_by over a hash join: the join holds memory, so the group_by writes 
 B = 8, peak frames 8:
 
 ```
-group_by hash      tuples_out=6000     comparisons=25790       reads=396     writes=396    partitions=3 spilled_pages=[44,45,51,14,4,13,4,12,15,14,17,6,1,1,1]
-  hash_join        tuples_out=6000     comparisons=6009418     reads=332     writes=166    partitions=6 pages_left/right=[13/13,14/14,14/14,14/14,15/15,13/13] overflowed=6
-    seqscan R6000  tuples_out=6000     comparisons=0           reads=81      writes=0      
-    seqscan S6000  tuples_out=6000     comparisons=0           reads=81      writes=0      
-total: tuples_out=6000 comparisons=6035208 reads=890 writes=562 peak_frames=8
+group_by hash tuples_out=6000 comparisons=9423 reads=189 writes=189 levels=1 partitions=7 spilled_pages=[4,4,4,4,4,4,4]
+  hash_join tuples_out=6000 comparisons=6009418 reads=332 writes=166 partitions=6 pages_left/right=[13/13,14/14,14/14,14/14,15/15,13/13] overflowed=6
+    seqscan R6000 tuples_out=6000 comparisons=0 reads=81 writes=0
+    seqscan S6000 tuples_out=6000 comparisons=0 reads=81 writes=0
 ```
 
 B = 16, peak frames 16:
 
 ```
-group_by hash      tuples_out=6000     comparisons=15280       reads=281     writes=281    partitions=7 spilled_pages=[18,18,18,18,18,19,18]
-  hash_join        tuples_out=6000     comparisons=25320       reads=168     writes=168    partitions=14 pages_left/right=[6/6,6/6,6/6,6/6,6/6,6/6,6/6,6/6,6/6,6/6,6/6,6/6,6/6,6/6] overflowed=0
-    seqscan R6000  tuples_out=6000     comparisons=0           reads=81      writes=0      
-    seqscan S6000  tuples_out=6000     comparisons=0           reads=81      writes=0      
-total: tuples_out=6000 comparisons=40600 reads=611 writes=449 peak_frames=16
+group_by hash tuples_out=6000 comparisons=8859 reads=199 writes=199 levels=1 partitions=15 spilled_pages=[2,2,2,2,2,2,2,2,2,2,2,2,2,2,2]
+  hash_join tuples_out=6000 comparisons=25320 reads=168 writes=168 partitions=14 pages_left/right=[6/6,6/6,6/6,6/6,6/6,6/6,6/6,6/6,6/6,6/6,6/6,6/6,6/6,6/6] overflowed=0
+    seqscan R6000 tuples_out=6000 comparisons=0 reads=81 writes=0
+    seqscan S6000 tuples_out=6000 comparisons=0 reads=81 writes=0
 ```
 
+## 7 Hash distinct against its formula
+
+A hash distinct of R, whose tuples are all different, so the groups take as many pages as the input. Its own reads and writes, and the formula of DESIGN_M2.md section 6.
+
+| N pages | B | levels | partitions per split | own reads | own writes | own I/O | formula | measured / formula |
+|---|---|---|---|---|---|---|---|---|
+| 80 | 4 | 4 | 3 | 364 | 364 | 728 | 564 | 1.29 |
+| 80 | 8 | 2 | 7 | 238 | 238 | 476 | 476 | 1.00 |
+| 80 | 16 | 1 | 15 | 102 | 102 | 204 | 210 | 0.97 |
+| 80 | 64 | 1 | 63 | 188 | 188 | 376 | 378 | 0.99 |
+| 80 | 256 | 0 | 255 | 0 | 0 | 0 | 0 | both 0 |
+| 320 | 4 | 5 | 3 | 2182 | 2182 | 4364 | 4284 | 1.02 |
+| 320 | 8 | 3 | 7 | 796 | 796 | 1592 | 1442 | 1.10 |
+| 320 | 16 | 2 | 15 | 1017 | 1017 | 2034 | 2040 | 1.00 |
+| 320 | 64 | 1 | 63 | 414 | 414 | 828 | 882 | 0.94 |
+| 320 | 256 | 1 | 255 | 757 | 757 | 1514 | 1530 | 0.99 |

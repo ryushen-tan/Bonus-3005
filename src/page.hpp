@@ -2,6 +2,7 @@
 #pragma once
 #include "algebra.hpp"
 #include "disk.hpp"
+#include <cmath>
 #include <cstdio>
 #include <string_view>
 
@@ -13,7 +14,13 @@ inline void put32(uint8_t* p, uint32_t v) { for (int i = 0; i < 4; i++) p[i] = u
 // a record is its fields in schema order: INT as 4 bytes, VARCHAR as a 2 byte length then the bytes;
 // in temporary files only, REAL (an AVG) as the 8 bytes of a double and BIGINT (a SUM) as 8 bytes
 inline Value intValue(long long i) { return {true, double(i), std::to_string(i)}; }
-inline Value realValue(double d) { char text[64]; std::snprintf(text, sizeof text, "%.4f", d); return {true, d, text}; }
+// four places with halves away from zero, as PostgreSQL's round(): %.4f alone takes 1/32 to 0.0312
+inline Value realValue(double d) {
+    double rounded = std::round(d * 10000) / 10000;
+    char text[64];
+    std::snprintf(text, sizeof text, "%.4f", rounded == 0 ? 0.0 : rounded);
+    return {true, d, text};
+}
 inline void encodeInto(std::string& out, const std::vector<Col>& cols, const Row& row) {
     for (size_t i = 0; i < cols.size(); i++) {
         uint8_t bytes[8];
@@ -35,15 +42,23 @@ inline void encodeInto(std::string& out, const std::vector<Col>& cols, const Row
     }
 }
 inline std::string encode(const std::vector<Col>& cols, const Row& row) { std::string out; encodeInto(out, cols, row); return out; }
+// the bytes come from a file, so a record shorter than its schema is an error rather than a read past its end
 inline Row decode(const std::vector<Col>& cols, std::string_view record) {
     Row row;
     row.reserve(cols.size());
     const uint8_t* p = (const uint8_t*)record.data();
+    const uint8_t* end = p + record.size();
+    auto take = [&](size_t bytes) {
+        if (size_t(end - p) < bytes) throw Error{"error: corrupt record: " + std::to_string(record.size()) + " bytes are too few for its schema"};
+        const uint8_t* field = p;
+        p += bytes;
+        return field;
+    };
     for (const Col& c : cols) {
-        if (c.type == StrT) { uint16_t n = get16(p); row.push_back({false, 0, std::string((const char*)p + 2, n)}); p += 2 + n; }
-        else if (c.type == RealT) { double d; std::memcpy(&d, p, 8); row.push_back(realValue(d)); p += 8; }
-        else if (c.type == BigT) { int64_t n; std::memcpy(&n, p, 8); row.push_back(intValue(n)); p += 8; }
-        else { row.push_back(intValue(int32_t(get32(p)))); p += 4; }
+        if (c.type == StrT) { uint16_t n = get16(take(2)); row.push_back({false, 0, std::string((const char*)take(n), n)}); }
+        else if (c.type == RealT) { double d; std::memcpy(&d, take(8), 8); row.push_back(realValue(d)); }
+        else if (c.type == BigT) { int64_t n; std::memcpy(&n, take(8), 8); row.push_back(intValue(n)); }
+        else row.push_back(intValue(int32_t(get32(take(4)))));
     }
     return row;
 }
@@ -54,7 +69,9 @@ inline size_t encodedSize(const std::vector<Col>& cols, const Row& row) {
 }
 
 // data page: page_id u32, slot_count u16, free_end u16, then 4 byte slots (offset u16, length u16)
-constexpr int DATA_HEADER = 8, SLOT_SIZE = 4, MAX_RECORD = PAGE_SIZE - DATA_HEADER, NO_SPACE = -1;
+// a record also needs its slot, so the longest one an empty page holds is 4088 - 4 = 4084 bytes
+constexpr int DATA_HEADER = 8, SLOT_SIZE = 4, USABLE_SPACE = PAGE_SIZE - DATA_HEADER,
+              MAX_RECORD = USABLE_SPACE - SLOT_SIZE, NO_SPACE = -1;
 struct Rid { uint32_t page, slot; };
 inline std::string ridText(Rid r) { return "(" + std::to_string(r.page) + ", " + std::to_string(r.slot) + ")"; }
 
@@ -82,13 +99,13 @@ inline int insertRecord(uint8_t* page, std::string_view record) {
     return slot;
 }
 inline bool live(const uint8_t* page, int slot) { return slotOffset(page, slot) != 0; }
-inline std::string_view recordAt(const uint8_t* page, int slot) {
-    Rid rid{pageIdOf(page), uint32_t(slot)};
-    if (slot >= slotCount(page)) throw Error{"error: no record at rid " + ridText(rid) + ", the page has " + std::to_string(slotCount(page)) + " slots"};
+inline std::string_view recordAt(const uint8_t* page, uint32_t slot) {
+    Rid rid{pageIdOf(page), slot};
+    if (slot >= uint32_t(slotCount(page))) throw Error{"error: no record at rid " + ridText(rid) + ", the page has " + std::to_string(slotCount(page)) + " slots"};
     if (!live(page, slot)) throw Error{"error: rid " + ridText(rid) + " is a deleted record"};
     return {(const char*)page + slotOffset(page, slot), size_t(slotLength(page, slot))};
 }
-inline void deleteRecord(uint8_t* page, int slot) {
+inline void deleteRecord(uint8_t* page, uint32_t slot) {
     recordAt(page, slot);
     put32(page + DATA_HEADER + SLOT_SIZE * slot, 0);
 }

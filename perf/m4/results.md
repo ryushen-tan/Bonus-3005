@@ -28,30 +28,30 @@ ANALYZE Works: 15000 tuples, 59 pages
 | 9 | 19 | 1.00 | 1.34 | project est 375 actual 279 | 127 | BNL BNL BNL | 1413 | 11.13 |
 | 10 | 1 | 1.00 | 1.00 | limit est 5 actual 5 | 155 | BNL BNL | 1082 | 6.98 |
 | 11 | 6 | 1.00 | 1.11 | sort est 334 actual 301 | 64 | - | 182 | 2.84 |
-| 12 | 10 | 1.00 | 152.27 | project est 30 actual 4568 | 82 | BNL | 156 | 1.90 |
-| 13 | 10 | 1.00 | 1.00 | sort est 40 actual 40 | 143 | BNL | 409 | 2.86 |
+| 12 | 10 | 1.00 | 152.27 | project est 30 actual 4568 | 64 | BNL | 80 | 1.25 |
+| 13 | 10 | 1.00 | 1.00 | sort est 40 actual 40 | 101 | BNL | 409 | 4.05 |
 | 14 | 9 | 1.00 | 5.00 | distinct est 25 actual 5 | 111 | BNL | 173 | 1.56 |
 | 15 | 9 | 1.00 | 8.62 | project est 13 actual 112 | 57 | BNL | 63 | 1.11 |
 | 16 | 10 | 1.01 | 1.06 | group_by est 50 actual 47 | 8 | BNL | 10 | 1.25 |
 | 17 | 9 | 1.00 | 8.82 | project est 72 actual 635 | 115 | BNL | 295 | 2.57 |
 | 18 | 7 | 1.00 | 2.00 | union est 10 actual 5 | 57 | - | 57 | 1.00 |
 | 19 | 15 | 1.04 | 3.93 | project est 1140 actual 290 | 123 | BNL BNL | 827 | 6.72 |
-| 20 | 11 | 1.02 | 5.26 | project est 1000 actual 190 | 117 | BNL | 361 | 3.09 |
+| 20 | 11 | 1.02 | 5.26 | project est 1000 actual 190 | 115 | BNL | 295 | 2.57 |
 
-Across all 161 nodes (23 nodes below a LIMIT left out): median q-error 1.00, worst 152.27. Unoptimised / optimised I/O: median 2.19, range 1.00 to 11.13.
+Across all 161 nodes (23 nodes below a LIMIT left out): median q-error 1.00, worst 152.27. Unoptimised / optimised I/O: median 2.02, range 1.00 to 11.13.
 
 ## 3 Which rule mattered (B = 16)
 
 | rules turned off | total I/O of the twenty queries | against all rules on |
 |---|---|---|
-| none | 1660 | 1.00 |
-| 1 | 2124 | 1.28 |
-| 2 | 3196 | 1.93 |
-| 3 | 1660 | 1.00 |
-| 4 | 1660 | 1.00 |
-| 5 | 1660 | 1.00 |
-| 6 | 2058 | 1.24 |
-| 7 | 1660 | 1.00 |
+| none | 1598 | 1.00 |
+| 1 | 2062 | 1.29 |
+| 2 | 3134 | 1.96 |
+| 3 | 1598 | 1.00 |
+| 4 | 1598 | 1.00 |
+| 5 | 1598 | 1.00 |
+| 6 | 1916 | 1.20 |
+| 7 | 1598 | 1.00 |
 
 ## The DP table of query 9, a four relation join, at B = 16
 
@@ -82,23 +82,23 @@ SELECT e.name, p.name, w.hours FROM Emp e JOIN Works w ON e.eid = w.eid JOIN Pro
 {p,d}  rows=100 pages=2    {d} outer, nested_loop_join with p inner  cost=4
 {p,d}  rows=100 pages=2    {d} outer, hash_join with p inner  cost=12
 {p,d}  rows=100 pages=2    {d} outer, sort_merge_join with p inner  cost=8
-{e,w,p}  rows=1875 pages=32    {e,w} outer, nested_loop_join with p inner  cost=143
+{e,w,p}  rows=1875 pages=32  * {e,w} outer, nested_loop_join with p inner  cost=143
 {e,w,p}  rows=1875 pages=32    {e,w} outer, hash_join with p inner  cost=194
 {e,w,p}  rows=1875 pages=32    {e,w} outer, sort_merge_join with p inner  cost=215
-{e,w,p}  rows=1875 pages=32  * {w,p} outer, nested_loop_join with e inner  cost=130
+{e,w,p}  rows=1875 pages=32    {w,p} outer, nested_loop_join with e inner  cost=184
 {e,w,p}  rows=1875 pages=32    {w,p} outer, hash_join with e inner  cost=256
 {e,w,p}  rows=1875 pages=32    {w,p} outer, sort_merge_join with e inner  cost=291
 {e,w,d}  no join predicate connects it, skipped
 {e,p,d}  no join predicate connects it, skipped
-{w,p,d}  rows=375 pages=5    {w,p} outer, nested_loop_join with d inner  cost=77
+{w,p,d}  rows=375 pages=5    {w,p} outer, nested_loop_join with d inner  cost=78
 {w,p,d}  rows=375 pages=5    {w,p} outer, hash_join with d inner  cost=107
 {w,p,d}  rows=375 pages=5    {w,p} outer, sort_merge_join with d inner  cost=92
 {w,p,d}  rows=375 pages=5  * {p,d} outer, nested_loop_join with w inner  cost=65
 {w,p,d}  rows=375 pages=5    {p,d} outer, hash_join with w inner  cost=81
 {w,p,d}  rows=375 pages=5    {p,d} outer, sort_merge_join with w inner  cost=73
-{e,w,p,d}  rows=375 pages=9    {e,w,p} outer, nested_loop_join with d inner  cost=165
-{e,w,p,d}  rows=375 pages=9    {e,w,p} outer, hash_join with d inner  cost=229
-{e,w,p,d}  rows=375 pages=9    {e,w,p} outer, sort_merge_join with d inner  cost=260
+{e,w,p,d}  rows=375 pages=9    {e,w,p} outer, nested_loop_join with d inner  cost=178
+{e,w,p,d}  rows=375 pages=9    {e,w,p} outer, hash_join with d inner  cost=242
+{e,w,p,d}  rows=375 pages=9    {e,w,p} outer, sort_merge_join with d inner  cost=273
 {e,w,p,d}  rows=375 pages=9  * {w,p,d} outer, nested_loop_join with e inner  cost=124
 {e,w,p,d}  rows=375 pages=9    {w,p,d} outer, hash_join with e inner  cost=232
 {e,w,p,d}  rows=375 pages=9    {w,p,d} outer, sort_merge_join with e inner  cost=276
@@ -166,16 +166,15 @@ project [e.name, e.city, e.age, e.did, e.mgr, w.hours]    est_rows=889      est_
 total est_cost=691
 ```
 ```
-project                tuples_out=7409     comparisons=0           reads=0       writes=0      
-  nested_loop_join     tuples_out=7409     comparisons=148020000   reads=0       writes=0      block_pages=2 blocks=12
-    project            tuples_out=2467     comparisons=0           reads=0       writes=0      
-      filter           tuples_out=2467     comparisons=20000       reads=0       writes=0      
-        rename e       tuples_out=20000    comparisons=0           reads=0       writes=0      
-          seqscan Emp  tuples_out=20000    comparisons=0           reads=220     writes=0      
-    project            tuples_out=720000   comparisons=0           reads=0       writes=0      
-      rename w         tuples_out=720000   comparisons=0           reads=0       writes=0      
-        seqscan Works  tuples_out=720000   comparisons=0           reads=2844    writes=0      
-total: tuples_out=7409 comparisons=148040000 reads=3064 writes=0 peak_frames=4
+project tuples_out=7409 comparisons=0 reads=0 writes=0
+  nested_loop_join tuples_out=7409 comparisons=148020000 reads=0 writes=0 block_pages=2 blocks=12
+    project tuples_out=2467 comparisons=0 reads=0 writes=0
+      filter tuples_out=2467 comparisons=20000 reads=0 writes=0
+        rename e tuples_out=20000 comparisons=0 reads=0 writes=0
+          seqscan Emp tuples_out=20000 comparisons=0 reads=220 writes=0
+    project tuples_out=720000 comparisons=0 reads=0 writes=0
+      rename w tuples_out=720000 comparisons=0 reads=0 writes=0
+        seqscan Works tuples_out=720000 comparisons=0 reads=2844 writes=0
 ```
 
 ```
@@ -192,14 +191,13 @@ project [e.name, e.city, e.age, e.did, e.mgr, w.hours]    est_rows=7093     est_
 total est_cost=727
 ```
 ```
-project                tuples_out=7409     comparisons=0           reads=0       writes=0      
-  hash_join            tuples_out=7409     comparisons=49405529    reads=797     writes=202    partitions=3 pages_left/right=[7/58,9/61,8/59] overflowed=3
-    project            tuples_out=2467     comparisons=0           reads=0       writes=0      
-      filter           tuples_out=2467     comparisons=20000       reads=0       writes=0      
-        rename e       tuples_out=20000    comparisons=0           reads=0       writes=0      
-          seqscan Emp  tuples_out=20000    comparisons=0           reads=220     writes=0      
-    project            tuples_out=60000    comparisons=0           reads=0       writes=0      
-      rename w         tuples_out=60000    comparisons=0           reads=0       writes=0      
-        seqscan Works  tuples_out=60000    comparisons=0           reads=237     writes=0      
-total: tuples_out=7409 comparisons=49425529 reads=1254 writes=202 peak_frames=4
+project tuples_out=7409 comparisons=0 reads=0 writes=0
+  hash_join tuples_out=7409 comparisons=49405529 reads=797 writes=202 partitions=3 pages_left/right=[7/58,9/61,8/59] overflowed=3
+    project tuples_out=2467 comparisons=0 reads=0 writes=0
+      filter tuples_out=2467 comparisons=20000 reads=0 writes=0
+        rename e tuples_out=20000 comparisons=0 reads=0 writes=0
+          seqscan Emp tuples_out=20000 comparisons=0 reads=220 writes=0
+    project tuples_out=60000 comparisons=0 reads=0 writes=0
+      rename w tuples_out=60000 comparisons=0 reads=0 writes=0
+        seqscan Works tuples_out=60000 comparisons=0 reads=237 writes=0
 ```

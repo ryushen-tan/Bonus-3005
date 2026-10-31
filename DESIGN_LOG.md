@@ -317,3 +317,198 @@ and unoptimised, and compares each result with PostgreSQL's.
 The first run agreed on 252 of 258. All six disagreements were one query whose AVG I compared by rounding
 both sides to three decimals. My AVG is already rounded to four, so a value near a boundary rounds
 differently from PostgreSQL's exact numeric. Comparing numbers within 0.0001 instead: 258 of 258.
+
+## 2026-10-31, session 14: three audits, and what the AI-written code got wrong
+
+Goal: find out whether "every test passes" meant the system was right. Every suite passed (225 tests),
+and so did the 258 end-to-end runs against PostgreSQL. Three independent reviews each took one part of
+the system with the module specifications and a PostgreSQL 17 instance. They tried the inputs my tests
+never used, and built the code with AddressSanitizer and UndefinedBehaviorSanitizer. Every item below
+was reproduced a second time before I accepted it.
+
+AI issues in Module 1 and week one:
+1. **A table named `catalog` erased the catalog.** The AI's `createTable` built the file name as
+   `name + ".db"`, removed any file of that name, and created the table there. For `catalog` that file is
+   the open catalog itself: the next command said `unknown table R`. Found by trying reserved names.
+2. **Case-only names shared a file.** Names are case-sensitive, but macOS's file system is not.
+   Creating `dept` after `Dept` removed `Dept.db`, so its rows were gone. Loading into `dept` then made
+   a scan of `Dept` decode `dept`'s 4-byte records with `Dept`'s schema, which ASan reported as a heap
+   overflow in `decode`. `--name ../victim` overwrote a file outside the database. Found the same way.
+3. **Records of 4085 to 4088 bytes were "loaded" and then gone.** The check allowed records up to 4088
+   bytes, the page's usable space, but a record also needs its 4-byte slot. The heap's
+   `insertIntoNewPage` ignored the `NO_SPACE` it got back and still counted the tuple:
+   `loaded 1 rows into W` followed by a scan of 0 rows. Through the shell, `INSERT` of a 4112-byte row
+   printed `INSERT 1` and stored nothing. Found by testing the boundary byte by byte instead of one
+   record well past it, which is all my session 9 test did.
+4. **A missing table file hung the tool.** The disk manager opened files with `O_CREAT` and returned a
+   zero page past the end of a file. A zero page 0 reads as a directory page whose next page is itself,
+   so `scan` followed it forever. Found by deleting `R.db` and scanning.
+5. **The report and the code disagreed.** REPORT_M1 says "Which I would ship: CLOCK", but every entry
+   point defaulted to LRU. And trace 2, "80/20 over 200 pages", only ever touched even page ids. The
+   generator drew twice per access from a power-of-two LCG, and that LCG's lowest bit alternates. So
+   the trace had 20 hot pages, not 40. Found by counting the distinct page ids in the trace file.
+
+Smaller: `scan --frames 0 --policy clock` segfaulted on an empty frame vector. A rid on a directory
+page, or a slot of 2^31 or more (passed through `int`), let `remove` zero a page header. Non-UTF-8 text
+went into VARCHARs and out as invalid JSON. Exceptions other than `Error` aborted the tool.
+
+AI issues in Module 2:
+1. **`limit` had no output schema.** The AI's plan builder never set it, so every SQL query with LIMIT
+   segfaulted the shell, including the module's example 5.4. A distinct over a limit grouped every
+   row into one, and a union of a 1-column and a 2-column limit was accepted. The end-to-end script ran
+   the four tools chained together, never the shell, which is why it never crashed. Found by running the
+   example queries through `./db`.
+2. **A column projected twice came out empty the second time.** `row.push_back(std::move(in[c]))` moved
+   the value out, so a second use of the same column copied an empty string, and `--json` printed
+   `[40, ]`. Found by projecting one column under two names.
+3. **The budget did not hold everywhere.** A nested loop with a memory-holding operator on both sides
+   failed at B = 4 ("hash grouping needs at least 3 frames, 2 are free"), although DESIGN_M2 says every
+   plan runs at B = 4. Hash grouping counted only each entry's key and 16 bytes per aggregate, but kept
+   the whole input row, so its "2 frames" held 278576 bytes. Found by putting blocking inputs on both
+   sides, and by summing the bytes actually held with a test harness.
+4. **Output depended on B.** A union of an INT column and an AVG printed `0.0000` at B = 4 and `0` at
+   B = 64, because only values that passed through a temporary file were converted to REAL. AVG printed
+   with `%.4f`, which rounds a tie such as 1/32 to 0.0312, where PostgreSQL's `round()` gives 0.0313.
+   Found by running each plan at several B and comparing with PostgreSQL.
+
+Smaller: a sort-mode group_by with no keys kept its temporary file after `close()`. A stray `child`
+field on a binary node was wired in as an input. A 20000-deep plan overflowed the JSON parser's stack.
+The trace padded its fields and added a `total:` line the specification's format does not have.
+
+AI issues in Module 3:
+1. **Valid SQL compiled into plans that could not run.** `SELECT d.did AS budget FROM Dept d ORDER BY
+   d.budget` passed `sql check`, then every module failed with "ambiguous attribute budget". The alias
+   was an unqualified name, and the executor's name resolution matched it against `d.budget` as well.
+   `GROUP BY a, a` passed and failed the same way. Found by comparing with PostgreSQL, which returns
+   10 rows.
+2. **The front end rejected SQL that PostgreSQL accepts.** It rejected `SELECT COUNT(*), COUNT(*)`,
+   `SELECT name, name`, SUM of a SUM ("t.s is BIGINT") and GROUP BY an output alias. A subquery with two
+   columns of one name was refused too. A 1000-term OR was refused as "nesting too deep", in the Bonus 1
+   message format instead of the specification's. An 8000-term OR overflowed the stack, because the
+   depth guard sits below the recursion it was meant to stop.
+3. **A JOIN ON could name a table from an earlier comma item.** PostgreSQL rejects that. Here the
+   optimised plan ran, and the unoptimised one failed with "unknown attribute d.did". Found by running
+   every query optimised and with `--baseline`.
+
+AI issues in Module 4 and the shell:
+1. **The optimizer segfaulted when one condition spanned three tables**
+   (`WHERE e.did = d.did OR p.did = d.did`). It did the same on any comma join of three or more tables
+   with rule 1 off. No pair was "connected", so every candidate list was empty, and the code read the
+   plan of a subset it had never built. Found by switching each rule off in turn.
+2. **The cost of hash grouping was a fiction at small B.** The model charged one partitioning pass. The
+   executor used B/2 partitions, which is 1 at B = 4, and spilled almost everything at each level. So
+   `SELECT DISTINCT eid, pid, hours FROM Works` was estimated at 177 page I/Os and did 3058, while the
+   sort plan it rejected does 414. DESIGN_M4 says "the cost model and Module 2 agree on every operator".
+   Found with EXPLAIN ANALYZE at B = 4. The sort cost also ignored the frame a memory-holding parent
+   keeps (estimated 4 passes, 7 in the trace).
+3. **Rule 5 pushed `1 = 2` below a GROUP BY with no keys.** "Uses only grouping columns" is vacuously
+   true for a condition with no columns, and a GROUP BY without keys still returns one row on empty input.
+4. **The shell lost input without saying so.** An unterminated string swallowed its statement and every
+   later one, and the shell exited 0. A `--` comment line before EXPLAIN made the command "not SELECT,
+   CREATE or INSERT". Error positions counted from each statement instead of the file. `ANALYZE T abc`
+   aborted the shell on an uncaught `stoi` exception.
+
+Three REPORT_M4 sentences were also contradicted by its own data: one about q15's block count, one
+about which join algorithms B = 4 chooses, and one about rule 3.
+
+The same mistakes appeared in a second, independent implementation of this specification in Python:
+the alias that also matched a qualified name, the off-by-4 page limit, `catalog` and case-only file
+names, SUM of a SUM, rule 5's empty condition, AVG's rounding, INT and REAL printing differently by B,
+and a report recommending CLOCK while the code defaulted to LRU. They are mistakes the AI makes, not
+accidents of one session.
+
+## 2026-10-31, session 15: fixing what the audits found
+
+Goal: fix every finding of session 14, each with a regression test written to fail on the old code, and
+keep every report true. The four modules were fixed separately and merged.
+
+What changed, by module:
+- **Storage.**
+  - Table names must be identifiers. `catalog` is refused in any case, and so is a name that differs
+    from an existing one only in case. Creating a table never removes a file: a new file is opened
+    with `O_EXCL`.
+  - A record over 4084 bytes is an error at load, at insert and in a temporary file. The old constant
+    4088 is now `USABLE_SPACE`, and `MAX_RECORD` is 4084.
+  - `get` and `remove` check the rid is on one of the table's data pages, and slots are compared
+    unsigned.
+  - A missing file, a read past the end of a file, or a directory chain that links back is an error,
+    not a hang.
+  - The catalog is written to a temporary file and renamed over the old one.
+  - `--frames 0` is one error for every tool, checked in the buffer pool.
+  - CLOCK is the default.
+  - Non-UTF-8 text is refused with its line and column, by the loader and now by the SQL scanner too.
+    The UTF-8 check moved to `lexer.hpp`, so both use the same function.
+  - `perf/m1.py` draws from the LCG's high bits. Trace 2 now has 40 hot pages, and REPORT_M1's tables
+    and sentences were regenerated from the new traces.
+- **Execution.**
+  - `limit` has its child's schema, and a projection copies a column used twice.
+  - A nested loop writes its inner input before the outer's reader takes a frame, so blocking inputs on
+    both sides run at B = 4.
+  - Hash grouping keeps only keys and aggregate state, counted at their real size. It now partitions
+    B − 1 ways like the Grace hash join. Its cost formula is in DESIGN_M2 §6: estimated 545, measured
+    546, where it used to do 3058.
+  - Set operations convert INT values to REAL, so a column prints one way at every B. AVG rounds a
+    half away from zero.
+  - Each operator takes only its own input fields.
+  - JSON nesting stops at 1000 levels.
+  - `exec trace` has the specification's format.
+  - SUM and AVG of a REAL (an AVG from a subquery) keep a double sum.
+- **SQL.**
+  - A bare name means the column with no relation when there is one.
+  - ORDER BY matches output names first, and two outputs of one name are ambiguous, as in PostgreSQL.
+  - Repeated output columns, and default aggregate names that are already taken, get `_2`. So does a
+    subquery's second column of one name.
+  - SUM of a SUM is accepted, and so is GROUP BY an output alias. A repeated GROUP BY key counts once.
+  - ON sees only its own JOIN chain, and `+1` is a number.
+  - An AND/OR chain is one node, built in a loop. A 1000-term OR now runs, and 8000 terms are a
+    one-line error in the specification's format instead of a stack overflow.
+- **Optimizer and shell.**
+  - The join enumeration always produces a plan, and a predicate over k relations is applied at the
+    first join that has them all.
+  - Rule 5 needs grouping keys, and looks names up in the group_by's own output.
+  - The sort and nested loop costs use the frames the executor gives each operator (B − 1 below a
+    memory holder).
+  - The shell skips `--` comments before EXPLAIN, ANALYZE and SET. It reports error positions in the
+    whole input and reports an unterminated string. It checks frames and bucket counts before using
+    them.
+  - Every tool reports an unexpected exception as one `internal error:` line instead of aborting.
+  - `tests/e2e/run.py` now also runs every query through `./db`.
+
+What broke while merging:
+1. The executor and the SQL front end each added a `MAX_DEPTH` constant, so nothing compiled. The JSON
+   parser's is now `MAX_JSON_DEPTH`.
+2. The executor's new hash cost and the optimizer's new frame budget changed the same lines. The merged
+   `hashCost` takes the operator's frames, the same way the sort cost does.
+3. **A wrong result appeared only when two fixes met.** With the SQL change, an aggregate named like a
+   key (`SELECT did, COUNT(*) AS did ... HAVING COUNT(*) > 100`) was no longer ambiguous. But rule 5
+   matched the HAVING's `did` against the key `Emp.did`, so it pushed the condition below the grouping
+   and returned 0 rows instead of 6. Rule 5 now resolves names in the group_by's output, where `did` is
+   the aggregate.
+4. `perf/m1.py` deleted `perf/m1/` and printed its tables, so rerunning it removed `results.md`.
+   README says it writes that file, so it does now, as `m2.py` and `m4.py` already did after the
+   execution and optimizer fixes.
+5. Two ad-hoc runs of the unoptimised plan of a three-table comma join, on the large measurement
+   data, wrote temporary files of 21 GB. They materialise a cross product of 3·10^8 rows. That plan is
+   meant to be naive. At the end-to-end check's scales (1 and 5) it is small enough to run.
+
+Verification:
+- **Tests:** 225 grew to 305 (Bonus 1 124, storage 44, execution 32, SQL 85, optimizer and shell 20),
+  and all pass, also under AddressSanitizer and UndefinedBehaviorSanitizer.
+- **End to end:** the check against PostgreSQL 17 agrees on 390 of 390 runs at scale 1 and 390 of 390
+  at scale 5. That is 44 queries at B = 4, 8 and 32, optimised and unoptimised, through the tools and
+  through the shell.
+- **Audit reproductions:** rerun on the merged code: the execution audit's whole script, and the
+  storage, SQL and shell cases.
+- **Measurements:** the three perf scripts were rerun. REPORT_M1 and REPORT_M2 match their output
+  exactly. REPORT_M4 was updated from it: query 12 now does 64 page I/Os (it was 82), query 20 does
+  115, the median gain is 2.02 and the rule 6 ablation is 1.20.
+
+Left as they are, on purpose:
+- No upper bound on `--frames`.
+- A condition of more than 1000 comparisons is refused, although PostgreSQL takes it. The
+  optimizer's `place` recurses once per conjunct.
+- `3000000000` is a type error, because INT is 4 bytes; the message now says so.
+- A subquery's renamed `pid_2` can be referenced, where PostgreSQL would call both columns `pid`.
+- Errors still go to standard output, as in Bonus Project 1.
+- The hash join's partitions are uneven for small INT keys. The grouping's new hash finaliser would fix
+  that too, but it would move most of REPORT_M2's and REPORT_M4's numbers.

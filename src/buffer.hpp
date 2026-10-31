@@ -18,7 +18,10 @@ struct BufferPool {
     unsigned long long accesses = 0, hits = 0, misses = 0, evictions = 0;
     int held = 0, peak = 0;
 
-    BufferPool(DiskManager& d, int frameCount, Policy p) : disk(d), policy(p), frames(size_t(frameCount)) {}
+    // every tool's --frames B ends up here, so this is the one check of it
+    BufferPool(DiskManager& d, int frameCount, Policy p) : disk(d), policy(p), frames(size_t(frameCount)) {
+        if (frameCount < 1) throw Error{"error: --frames must be at least 1"};
+    }
 
     static constexpr size_t NONE = size_t(-1);
     size_t chooseVictim() {

@@ -2,8 +2,9 @@
 
 Machine: Apple M5 Pro, 24 GB, macOS 26.5.2, Apple clang 21.0.0, `-std=c++17 -O2`. Every number comes
 from `python3 perf/m2.py`, which builds the tables with `./storage`, runs plans with `./exec`, and writes
-`perf/m2/results.md` (the tables below) and the two plots. It takes about three minutes. The counters
-are deterministic: a second run printed identical tables.
+`perf/m2/results.md` (the tables below) and the two plots. It took 44 seconds. The counters are
+deterministic, and they do not depend on the buffer policy: a second run with `--policy lru` given to
+every `exec` wrote identical tables and plots to those of the default, CLOCK.
 
 The data: `R(a INT, b INT, pad VARCHAR(40))` and `S(b INT, c INT, pad VARCHAR(40))`. They have n tuples
 each, with join keys that are permutations of 0 to n − 1, so each R tuple matches exactly one S tuple and
@@ -59,14 +60,17 @@ measured = formula + 1 + ceil(M / (B − 2)). At M = 320, B = 4 that is 51520 + 
 the measured number. Its comparisons were |R| · |S| in every run (`block nested loop compares exactly
 |R| x |S| pairs, at every B` in the tests), independent of B.
 
-**Sort-merge join exceeds the formula by exactly M + N writes and two directory reads, in every row.**
+**Sort-merge join exceeds the formula by M + N writes and two directory reads, in every row but one.**
 For example 4482 = 3840 + 640 + 2 at M = 320, B = 16. The formula's sort(M) = 2M(passes − 1) + M counts
 the final pass of the sort as a read that streams into its parent. My merge join cannot stream its
 sorts' final passes: it would then need 2(B − 1) frames for the two final merges. So it writes each
 side's final pass as one sorted run and reads that run in the merge. That costs M + N writes that the
 formula leaves out, while the formula's "+ M + N" for the merge's reads matches what my merge does.
-The ratio is highest when both sides fit in one run (B ≥ 64 at 20 pages). Then the formula's sort costs
-only its input read, while my join still writes and rereads the sorted runs.
+The exception is M = 80, B = 4, where 1410 is 1280 + 162 − 32. There each sort carries an 8 page run
+through its third pass untouched (section 2), which saves reading and writing those 8 pages on each
+side, 32 page I/Os the formula counts. The ratio is highest when both sides fit in one run (B ≥ 64 at
+20 pages). Then the formula's sort costs only its input read, while my join still writes and rereads
+the sorted runs.
 
 **Hash join departs from the formula in two directions, for two different reasons.**
 1. *Part-full partition pages when B is large.* P = B − 1 partitions are used whatever the input size,
@@ -183,9 +187,8 @@ neither, predicts neither.
 A sort of `Twenty` (82 data pages, more than 20 · B = 80) at B = 4:
 
 ```
-sort              tuples_out=6600     comparisons=82556       reads=236     writes=236    passes=4
-  seqscan Twenty  tuples_out=6600     comparisons=0           reads=83      writes=0
-total: tuples_out=6600 comparisons=82556 reads=319 writes=236 peak_frames=4
+sort tuples_out=6600 comparisons=82556 reads=236 writes=236 passes=4
+  seqscan Twenty tuples_out=6600 comparisons=0 reads=83 writes=0
 ```
 
 It completes, in 4 passes (the formula gives 1 + ceil(log 21 / log 3) = 4). **The most frames held at
@@ -202,25 +205,61 @@ A hash group_by over a hash join. The join holds memory, so the group_by writes 
 temporary file before taking memory itself (DESIGN_M2.md section 2):
 
 ```
-B = 16
-group_by hash      tuples_out=6000     comparisons=15280       reads=281     writes=281    partitions=7 spilled_pages=[18,18,18,18,18,19,18]
-  hash_join        tuples_out=6000     comparisons=25320       reads=168     writes=168    partitions=14 ... overflowed=0
-    seqscan R6000  tuples_out=6000     reads=81
-    seqscan S6000  tuples_out=6000     reads=81
-total: reads=611 writes=449 peak_frames=16
+B = 16, peak frames 16
+group_by hash tuples_out=6000 comparisons=8859 reads=199 writes=199 levels=1 partitions=15 spilled_pages=[2,2,2,2,2,2,2,2,2,2,2,2,2,2,2]
+  hash_join tuples_out=6000 comparisons=25320 reads=168 writes=168 partitions=14 pages_left/right=[6/6,...] overflowed=0
+    seqscan R6000 tuples_out=6000 comparisons=0 reads=81 writes=0
+    seqscan S6000 tuples_out=6000 comparisons=0 reads=81 writes=0
 ```
 
-The group_by's own 281 writes are 154 pages of join output written once, and its 127 pages of
-partitions. Its 281 reads are those 154 pages read back, plus the partitions. So the materialisation
-costs 2 × 154 = 308 page I/Os here, 29% of the plan's 1060. A fully pipelined executor would not pay that,
-but it would have needed two operators holding memory at once. Note also that the join runs with 14
+The group_by's own 199 writes are 154 pages of join output (6000 tuples of 100 bytes, 39 to a page)
+written once, the 15 pages of its table written out when the 6000 groups did not fit in its 15 frames,
+and 30 pages of partitions. Its 199 reads are the same pages read back. So the materialisation costs
+2 × 154 = 308 page I/Os here, 34% of the plan's 896. A fully pipelined executor would not pay that, but
+it would have needed two operators holding memory at once. Note also that the join runs with 14
 partitions, not 15, because it leaves one frame for the group_by's writer. At B = 8 that left it 6
-partitions of 13 or 14 pages, which all overflowed (6 million comparisons), so the frame matters most when
-memory is tight.
+partitions of 13 to 15 pages, which all overflowed (6 million comparisons), so the frame matters most
+when memory is tight.
 
-## 7 Sources
+## 7 Hash distinct against its formula
+
+A hash distinct of R, all of whose tuples differ, so its groups take as many pages as its input. The
+formula is that of DESIGN_M2.md section 6 with R = G = N, and the I/O is the operator's own, beyond the
+scan of its input:
+
+| N pages | B | levels | partitions per split | own reads | own writes | own I/O | formula | measured / formula |
+|---|---|---|---|---|---|---|---|---|
+| 80 | 4 | 4 | 3 | 364 | 364 | 728 | 564 | 1.29 |
+| 80 | 8 | 2 | 7 | 238 | 238 | 476 | 476 | 1.00 |
+| 80 | 16 | 1 | 15 | 102 | 102 | 204 | 210 | 0.97 |
+| 80 | 64 | 1 | 63 | 188 | 188 | 376 | 378 | 0.99 |
+| 80 | 256 | 0 | 255 | 0 | 0 | 0 | 0 | both 0 |
+| 320 | 4 | 5 | 3 | 2182 | 2182 | 4364 | 4284 | 1.02 |
+| 320 | 8 | 3 | 7 | 796 | 796 | 1592 | 1442 | 1.10 |
+| 320 | 16 | 2 | 15 | 1017 | 1017 | 2034 | 2040 | 1.00 |
+| 320 | 64 | 1 | 63 | 414 | 414 | 828 | 882 | 0.94 |
+| 320 | 256 | 1 | 255 | 757 | 757 | 1514 | 1530 | 0.99 |
+
+**One level of partitions is the normal case.** Every split uses all B − 1 frames, so a single level
+suffices once (B − 1)² ≥ N: from B = 16 at N = 80 and from B = 64 at N = 320. The reads equal the
+writes in every row, because every page written is read back once. In eight of the ten rows the
+measurement is within 6% of the formula. The formula assumes that a level's partitions are the same
+size. At N = 80, B = 4 the third level writes 27 partitions that it expects at 80 / 27 = 2.96 pages,
+just under the 3 frames. With their part-full pages, 9 of the 27 came out at 4 pages and needed a
+fourth level, which is the 29%. N = 320 at B = 8 is the same effect, smaller. Where the measurement is
+below the formula, the formula has rounded every partition up: at N = 320, B = 64 it counts 6 pages
+for each of the 63 partitions, and 27 of them took 5. The executor this replaced gave the table and the
+partition buffers half the frames each, which is one partition at B = 4 and two at B = 5. Each level
+then took out only the groups that fit in the table and wrote the rest again, so the I/O grew with the
+square of the input. At B = 4,
+`SELECT DISTINCT eid, pid, hours FROM Works` on the scale 5 data (59 pages) cost 3058 page I/Os that
+way. This executor's hash distinct costs 546, against 414 for the sort, and the optimizer, whose
+estimates for the two are now 545 and 413, picks the sort.
+
+## 8 Sources
 
 Ramakrishnan and Gehrke, chapters 13 and 14: the external sort's pass count and the three join cost
 formulas measured here. Shapiro, *Join Processing in Database Systems with Large Main Memories*, ACM
 TODS 1986: the grace hash join and the condition, roughly B ≥ √M, under which its partitions fit, which
-is the explanation of the B = 4 rows. DESIGN_M2.md section 8 says what each changed in the design.
+is the explanation of the B = 4 rows of section 1 and of when one level suffices in section 7.
+DESIGN_M2.md section 8 says what each changed in the design.

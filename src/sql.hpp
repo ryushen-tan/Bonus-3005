@@ -46,5 +46,7 @@ inline int sqlTool(const std::vector<std::string>& args, std::ostream& out) {
         return 1;
     } catch (const Error& e) {
         return report(e, out);
+    } catch (const std::exception& e) {
+        return report(Error{std::string("internal error: ") + e.what()}, out);
     }
 }

@@ -3,12 +3,14 @@
 Code: `src/optimizer.hpp` (ANALYZE, estimates, the rules, the cost model, join enumeration, physical plan
 output), `src/opt.hpp` (the `opt` tool). Tests: `tests/test_opt.cpp`. These check that the worked
 examples of sections 2, 3 and 5.1 reproduce, and that every item of the checklist holds. They also run
-23 SQL queries through all four modules at B = 4, 8 and 32, optimised and unoptimised, and require the
-same rows. `tests/e2e/run.py` checks 44 queries against PostgreSQL.
+24 SQL queries through all four modules at B = 4, 8 and 32, optimised and unoptimised, and require the
+same rows, and they test the `db` shell. `tests/e2e/run.py` checks 44 queries against PostgreSQL, through
+the four tools chained by file and through the shell.
 
 ## 1 Statistics
 
-`opt analyze --table R` (or `ANALYZE R` in the shell) computes exactly, with no sampling:
+`opt analyze --table R` (or `ANALYZE R` in the shell, `ANALYZE R 50` for 50 buckets) computes exactly,
+with no sampling. Both take 1 to 999999999 buckets:
 
 | statistic | how |
 |---|---|
@@ -91,7 +93,7 @@ is how REPORT_M4.md measures what each is worth.
 | 2 | a select moves below a join or cross into the side that has every column it names | every column of the predicate resolves on that one side. A select also moves below another select, since selects commute |
 | 3 | an equality between a column of each side, sitting on a cross, turns the cross into a join; on a join it joins the join's condition | the predicate is `column = column` with one column on each side |
 | 4 | a select moves below a rename, with its columns renamed through it, and into both inputs of a union or union_all, with the right input's columns matched by position | always valid. **Except** that a select is not moved below a rename sitting directly on a scan: that rename is part of the access path, moving it gains nothing, and the module's own example (section 3) keeps `select e.age>60` above `rename e (scan Emp)` |
-| 5 | a select moves below a group_by | every column it names is a grouping column. A predicate on an aggregate never moves |
+| 5 | a select moves below a group_by | every column it names is a grouping column, and there is at least one. A predicate on an aggregate never moves. With no grouping columns the group_by returns one row even for an empty input, so a select that names no column (a constant, like `1 = 2`) stays above it |
 | 6 | a projection below each input of a join, a cross and a group_by, keeping the columns its ancestors need plus those the operator itself needs | it must drop at least one column. "Needed" is computed top down from the root's output columns, so a column a predicate higher up still uses is never dropped |
 | 7 | a projection that keeps every column in order with no alias is removed; two adjacent selects become one | none. Merged conjuncts are sorted by their text, so the same predicates give the same plan however they were written |
 
@@ -101,23 +103,31 @@ The worked example of section 3 reproduces exactly (test `section 3 rewrite exam
 ## 4 Cost model
 
 Cost is page I/O. M and N are the estimated pages of a node's inputs, B the frames. These are the
-module's formulas, with one refinement. Where an input is a scan with filters, projections or renames
-on it (an **access path**), reading it once costs the scan's pages, not the pages of the filtered output.
-So each formula below uses read(x) for "pages read to get x once" (the scan's cost for an access path,
-the estimated pages for anything else) and pages(x) for the size of x. For unfiltered inputs the two are
-equal, and the formulas are exactly the module's.
+module's formulas, with two refinements. First, where an input is a scan with filters, projections or
+renames on it (an **access path**), reading it once costs the scan's pages, not the pages of the filtered
+output. So each formula below uses read(x) for "pages read to get x once" (the scan's cost for an access
+path, the estimated pages for anything else) and pages(x) for the size of x. For unfiltered inputs the
+two are equal. Second, F is the frames the operator really works in, which is B, or B − 1 below an
+operator that holds memory. Module 2 writes an input that holds memory to a temporary file before the
+operator above it takes its own memory (DESIGN_M2.md section 2), and that input must leave the file's
+output frame free: a sort there makes runs of B − 1 pages and merges B − 2 at a time, and a nested loop
+there has a block of B − 3 pages. In a left-deep join block, every join but the top one is below another
+join. At the top of a plan F = B, and the formulas are exactly the module's.
 
 | operator | own cost | module formula |
 |---|---|---|
 | seqscan | n_pages(T) | M |
 | filter, project, rename, limit, union_all | 0 | 0 |
-| sort | read(x) + 2 · pages(x) · (passes − 1), passes = 1 + ceil(log(ceil(M / B)) / log(B − 1)) | 2M(passes − 1) + M |
-| distinct, group_by | the cheaper of the sort, or hashing: read(x) when pages(x) ≤ B − 1, else read(x) + 2 · pages(x); with no keys, read(x) | cost of the sort or the hash partitioning |
-| nested_loop_join | read(outer) + ceil(pages(outer) / (B − 2)) · read(inner) | M + ceil(M / (B − 2)) · N |
+| sort | read(x) + 2 · pages(x) · (passes − 1), passes = 1 + ceil(log(ceil(M / F)) / log(F − 1)) | 2M(passes − 1) + M |
+| distinct, group_by | the cheaper of the sort, or hashing. For hashing, R is the pages of one group record per input tuple: pages(x) for distinct; for group_by, rows(x) × (the keys' widths + 8 per aggregate, + 8 more for sum and avg, + the column's width for min and max) / 4096. G = R · groups / rows(x), and W is the memory − 1 frames beside the input page. The cost is read(x) when G ≤ W, else read(x) + Σ over k = 0, 1, … while G / W^k > W of 2W · W^k + 2W^(k+1) · ceil(R / W^(k+1)). With no keys, read(x) | cost of the sort or the hash partitioning (DESIGN_M2 §6) |
+| nested_loop_join | read(outer) + ceil(pages(outer) / (F − 2)) · read(inner) | M + ceil(M / (B − 2)) · N |
 | sort_merge_join | sortcost(outer) + sortcost(inner) + pages(outer) + pages(inner) | sort(M) + sort(N) + M + N |
 | hash_join | read(outer) + read(inner) + 2 · (pages(outer) + pages(inner)) | 3(M + N) |
 | union | one sort over both inputs | |
 | intersect, except | like the sort merge join | |
+
+So a plan needs B ≥ 4: below an operator that holds memory a sort has B − 1 frames, and it needs three
+to merge. `opt plan`, `opt explain`, `opt dp-table` and the shell refuse fewer.
 
 A plan's total cost is the sum of its operators' own costs. The exception is that an access path's scan
 is not added again under an operator whose formula already reads it. That is the rule the module's DP
@@ -125,10 +135,11 @@ example uses: {A,B'} costs 110, not 110 plus the two scans; {A,B',C} costs 110 +
 {A,B'}'s total because that input is not an access path. `opt explain` prints each node's own cost, as
 the module's explain example does, and the plan's total on the last line.
 
-**The cost model and Module 2 agree on every operator**: they are the same formulas. REPORT_M2.md
-measures where the executor's real I/O departs from them:
+**The cost model and Module 2 agree on every operator**: they are the same formulas, with the frames
+Module 2 gives each operator. REPORT_M2.md measures where the executor's real I/O departs from them:
 - one directory page per scan;
 - part-full partition pages in the hash join;
+- uneven hash-grouping partitions, which can need one level more than the formula (REPORT_M2 §7);
 - the sorted runs of a merge join being written once more;
 - materialised intermediate results.
 
@@ -149,11 +160,20 @@ from. Then:
 - For each subset S of size 2 up to n, for each r in S whose S − {r} has a plan, and for each
   algorithm, the cost is computed as above with best[S − {r}] as the outer (left) and leaf r as the inner
   (right). The predicates applied at that join are the ones whose leaves are all in S, that include r,
-  and that include something in S − {r}. Hash and sort-merge joins are considered only when all of them
-  are equalities between a column of each side. The nested loop takes any condition, or none.
-- **Cross products**: a subset whose leaves the predicates do not connect is skipped when the whole
-  query is connected, because then a plan without cross products exists. This is why the module's table
-  says "{A,C} no predicate, skipped". When the query graph is not connected, cross products are allowed.
+  and that include something in S − {r}. So a predicate over k leaves, like `e.did = d.did OR p.did =
+  d.did` over three, is applied at the first join that has all k. Hash and sort-merge joins are
+  considered only when all of them are equalities between a column of each side. The nested loop takes
+  any condition, or none. The join at the top of the block is costed with the F of where the block
+  sits (section 4); every other join is the outer input of a join, so with B − 1.
+- **Cross products**: first, the subsets that a left-deep plan can build without a cross product are
+  found: those where some leaf r joins S − {r} by a predicate and S − {r} is such a subset itself. When
+  the whole query is one, every other subset is skipped, because a plan without cross products exists.
+  This is why the module's table says "{A,C} no predicate, skipped". When it is not, because two parts
+  of the query have no predicate between them or are linked only by a predicate over three or more
+  leaves, every subset is built, and a subset uses a cross product only when no join with a predicate
+  can build it. So there is always a plan, as the module's "unless no alternative" asks. With rule 1
+  off, a whole WHERE over several tables is one such predicate, and it waits for the join that has all
+  of them.
 - Ties go to the written order (the last relation is tried as the inner first), so a query with no
   information to choose by keeps the order it was written in.
 - The rows of a subset are computed once, as the product of its leaves' rows and of every predicate

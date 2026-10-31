@@ -7,7 +7,7 @@
 // ---- ANALYZE: one scan writes each column to its own run, and each run goes through the external sort ----
 
 inline void analyzeTable(Database& db, Table& t, int buckets) {
-    if (buckets < 1) throw Error{"error: --buckets must be at least 1"};
+    if (buckets < 1) throw Error{"error: the number of buckets must be at least 1"};
     size_t columns = t.cols.size();
     if (db.pool.freeFrames() < int(columns) + 3)
         throw Error{"error: ANALYZE of " + t.name + " needs at least " + std::to_string(columns + 3) + " frames: one per column, one for the scan, and three for a sort"};
@@ -134,6 +134,9 @@ inline double selectivity(const Node& c, const std::vector<ColumnInfo>& cols) {
 
 // ---- the optimizer ----
 
+// below an operator that holds memory a sort has B - 1 frames, and it needs 3 to merge
+constexpr int MIN_PLAN_FRAMES = 4;
+
 struct Candidate { uint32_t outer; int inner; std::string algorithm; double cost; std::vector<int> preds; };
 struct Optimizer {
     Database& db;
@@ -170,7 +173,7 @@ struct Optimizer {
             for (const std::string& k : n.keys) { Node a = attrNode(k); out.push_back(in[resolve(in, a)]); }
             for (const auto& a : n.aggregates) {
                 Col c{"", a[2], IntT};
-                if (a[0] == "sum") c.type = BigT;
+                if (a[0] == "sum") { Node x = attrNode(a[1]); c.type = in[resolve(in, x)].type == RealT ? RealT : BigT; }
                 else if (a[0] == "avg") c.type = RealT;
                 else if (a[0] != "count") { Node x = attrNode(a[1]); const Col& s = in[resolve(in, x)]; c.type = s.type; c.length = s.length; }
                 out.push_back(c);
@@ -249,10 +252,17 @@ struct Optimizer {
             n.kids[0] = place(std::move(n.kids[0]), cond);
             return n;
         }
-        if (n.op == "group_by" && on(5)) {
-            std::vector<Col> in = outputCols(n.kids[0]), keys;
-            for (const std::string& k : n.keys) { Node a = attrNode(k); keys.push_back(in[resolve(in, a)]); }
-            if (allIn(c, keys)) { n.kids[0] = place(std::move(n.kids[0]), cond); return n; }
+        // with no grouping columns the group_by returns a row even when the select below it removes them all
+        // a name is looked up in the group_by's own output, where an aggregate named like a key is not that key
+        if (n.op == "group_by" && on(5) && !n.keys.empty()) {
+            std::vector<Col> out = outputCols(n);
+            std::vector<std::string> names;
+            attrs(c, names);
+            bool onlyKeys = std::all_of(names.begin(), names.end(), [&](const std::string& name) {
+                Node a = attrNode(name);
+                return resolvesIn(name, out) && resolve(out, a) < n.keys.size();
+            });
+            if (onlyKeys) { n.kids[0] = place(std::move(n.kids[0]), cond); return n; }
         }
         return wrapSelect(std::move(n), cond);
     }
@@ -275,26 +285,42 @@ struct Optimizer {
     }
     // the pages read to get a node's output once: a scan's own pages, or the pages of a result
     static double read(const LogicalNode& n) { return accessPath(n) ? n.total : n.pages; }
-    int passes(double pages) const {
-        double runs = std::ceil(pages / frames);
-        return runs <= 1 ? 1 : 1 + int(std::ceil(std::log(runs) / std::log(frames - 1.0)));
+    // the frames an operator works in: B, or B - 1 below an operator that holds memory, because that one
+    // writes its input to a temporary file first and the input must leave the file's frame free
+    static bool holdsMemory(const LogicalNode& n) { return n.op != "scan" && n.op != "select" && n.op != "project" && n.op != "rename" && n.op != "limit" && n.op != "union_all"; }
+    int memoryBelow(const LogicalNode& n, int memory) const { return holdsMemory(n) ? frames - 1 : memory; }
+    static int passes(double pages, int memory) {
+        double runs = std::ceil(pages / memory);
+        return runs <= 1 ? 1 : 1 + int(std::ceil(std::log(runs) / std::log(memory - 1.0)));
     }
-    double sortCost(const LogicalNode& in) const { return read(in) + 2 * in.pages * (passes(in.pages) - 1); }
+    static double sortCost(const LogicalNode& in, int memory) { return read(in) + 2 * in.pages * (passes(in.pages, memory) - 1); }
+    // hash distinct and group_by as Module 2 runs them, records being the pages of one group record per input
+    // tuple: one pass when the groups fit in the memory - 1 frames beside the input page. Otherwise each input
+    // whose groups do not fit writes its full table out and reads it back, and splits its records memory - 1
+    // ways, each partition's last page part full, to be read back at the next level
+    static double hashCost(const LogicalNode& in, double records, double groups, int memory) {
+        double work = memory - 1, groupPages = records * groups / in.rows, cost = read(in);
+        for (double inputs = 1; groupPages / inputs > work; inputs *= work) {
+            double parts = inputs * work;
+            cost += 2 * work * inputs + 2 * parts * std::ceil(records / parts);
+        }
+        return cost;
+    }
     static double pagesFor(double rows, const std::vector<ColumnInfo>& cols) {
         double width = 0;
         for (const ColumnInfo& c : cols) width += c.width;
         return std::max(1.0, std::ceil(rows * width / PAGE_SIZE));
     }
     static double rowsOut(double rows) { return std::max(1.0, std::ceil(rows - 1e-9)); }
-    double joinCost(const std::string& algorithm, const LogicalNode& outer, const LogicalNode& inner) const {
-        if (algorithm == "nested_loop_join") return read(outer) + std::ceil(outer.pages / (frames - 2)) * read(inner);
+    static double joinCost(const std::string& algorithm, const LogicalNode& outer, const LogicalNode& inner, int memory) {
+        if (algorithm == "nested_loop_join") return read(outer) + std::ceil(outer.pages / (memory - 2)) * read(inner);
         if (algorithm == "hash_join") return read(outer) + read(inner) + 2 * (outer.pages + inner.pages);
-        return sortCost(outer) + sortCost(inner) + outer.pages + inner.pages;
+        return sortCost(outer, memory) + sortCost(inner, memory) + outer.pages + inner.pages;
     }
     // fills in rows, pages, own cost and total cost of every node, and returns its columns
-    std::vector<ColumnInfo> estimate(LogicalNode& n) {
+    std::vector<ColumnInfo> estimate(LogicalNode& n, int memory) {
         std::vector<std::vector<ColumnInfo>> in;
-        for (LogicalNode& k : n.kids) in.push_back(estimate(k));
+        for (LogicalNode& k : n.kids) in.push_back(estimate(k, memoryBelow(n, memory)));
         std::vector<ColumnInfo> out;
         double rows = n.kids.empty() ? 0 : n.kids[0].rows;
         n.cost = 0;
@@ -338,7 +364,7 @@ struct Optimizer {
                 bindCond(c, cols);
                 rows *= selectivity(c, out);
             }
-            n.cost = joinCost(n.algorithm.empty() ? "nested_loop_join" : n.algorithm, n.kids[0], n.kids[1]);
+            n.cost = joinCost(n.algorithm.empty() ? "nested_loop_join" : n.algorithm, n.kids[0], n.kids[1], memory);
         }
         else if (n.op == "group_by") {
             std::vector<Col> cols = colsOf(in[0]);
@@ -347,8 +373,14 @@ struct Optimizer {
             rows = n.keys.empty() ? 1 : std::min(rows, groups);
             std::vector<Col> outCols = outputCols(n);
             for (size_t i = n.keys.size(); i < outCols.size(); i++) out.push_back({outCols[i], nullptr, 0, std::max(1.0, rows), defaultWidth(outCols[i])});
-            double sortWay = n.keys.empty() ? read(n.kids[0]) : sortCost(n.kids[0]);
-            double hashWay = n.kids[0].pages <= frames - 1 ? read(n.kids[0]) : read(n.kids[0]) + 2 * n.kids[0].pages;
+            double sortWay = n.keys.empty() ? read(n.kids[0]) : sortCost(n.kids[0], memory);
+            double recordWidth = 0;
+            for (size_t i = 0; i < n.keys.size(); i++) recordWidth += out[i].width;
+            for (const auto& a : n.aggregates) {
+                recordWidth += a[0] == "sum" || a[0] == "avg" ? 16 : 8;
+                if (a[0] == "min" || a[0] == "max") { Node x = attrNode(a[1]); recordWidth += in[0][resolve(cols, x)].width; }
+            }
+            double hashWay = hashCost(n.kids[0], std::max(1.0, std::ceil(n.kids[0].rows * recordWidth / PAGE_SIZE)), rows, memory);
             if (n.algorithm.empty()) n.algorithm = n.keys.empty() || sortWay < hashWay ? "sort" : "hash";
             n.cost = n.algorithm == "sort" ? sortWay : hashWay;
         }
@@ -357,12 +389,12 @@ struct Optimizer {
             double groups = 1;
             for (const ColumnInfo& c : out) groups *= c.ndv;
             rows = std::min(rows, groups);
-            double sortWay = sortCost(n.kids[0]);
-            double hashWay = n.kids[0].pages <= frames - 1 ? read(n.kids[0]) : read(n.kids[0]) + 2 * n.kids[0].pages;
+            double sortWay = sortCost(n.kids[0], memory);
+            double hashWay = hashCost(n.kids[0], n.kids[0].pages, rows, memory);
             if (n.algorithm.empty()) n.algorithm = sortWay < hashWay ? "sort" : "hash";
             n.cost = n.algorithm == "sort" ? sortWay : hashWay;
         }
-        else if (n.op == "sort") { out = in[0]; n.cost = sortCost(n.kids[0]); }
+        else if (n.op == "sort") { out = in[0]; n.cost = sortCost(n.kids[0], memory); }
         else if (n.op == "limit") { out = in[0]; rows = std::min(rows, double(n.n)); }
         else {
             out = in[0];
@@ -374,8 +406,8 @@ struct Optimizer {
             else if (n.op == "union") rows = std::min(l.rows + r.rows, either);
             else if (n.op == "intersect") rows = std::min({l.rows, r.rows, both});
             else rows = std::min(l.rows, left);
-            if (n.op == "union") { double p = l.pages + r.pages; n.cost = read(l) + read(r) + 2 * p * (passes(p) - 1); }
-            else if (n.op != "union_all") n.cost = sortCost(l) + sortCost(r) + l.pages + r.pages;
+            if (n.op == "union") { double p = l.pages + r.pages; n.cost = read(l) + read(r) + 2 * p * (passes(p, memory) - 1); }
+            else if (n.op != "union_all") n.cost = sortCost(l, memory) + sortCost(r, memory) + l.pages + r.pages;
         }
         n.rows = n.op == "limit" ? std::max(0.0, std::min(rowsOut(rows), double(n.n))) : rowsOut(rows);
         for (ColumnInfo& c : out) c.ndv = std::max(1.0, std::min(c.ndv, n.rows));
@@ -408,8 +440,8 @@ struct Optimizer {
                 return;
             }
         }
-        Leaf leaf{reorder(std::move(n)), {}, ""};
-        leaf.cols = estimate(leaf.node);
+        Leaf leaf{reorder(std::move(n), frames - 1), {}, ""};
+        leaf.cols = estimate(leaf.node, frames - 1);
         std::set<std::string> rels;
         for (const ColumnInfo& c : leaf.cols) rels.insert(c.col.rel);
         leaf.name = rels.size() == 1 && !rels.begin()->empty() ? *rels.begin() : "input" + std::to_string(leaves.size() + 1);
@@ -420,7 +452,7 @@ struct Optimizer {
         for (size_t i = 0; i < leaves.size(); i++) if (mask >> i & 1) s += (s.size() > 1 ? "," : "") + leaves[i].name;
         return s + "}";
     }
-    LogicalNode joinBlock(LogicalNode n) {
+    LogicalNode joinBlock(LogicalNode n, int memory) {
         std::vector<Leaf> leaves;
         std::vector<std::pair<std::string, bool>> texts;
         collect(n, leaves, texts);
@@ -435,7 +467,7 @@ struct Optimizer {
             if (__builtin_popcount(p.leaves) >= 2 && !(fromSelect && !on(3))) { preds.push_back(p); continue; }
             if (__builtin_popcount(p.leaves) >= 2) { above.push_back(t); continue; }
             int only = p.leaves ? __builtin_ctz(p.leaves) : 0;
-            if (on(2)) { leaves[size_t(only)].node = place(std::move(leaves[size_t(only)].node), t); leaves[size_t(only)].cols = estimate(leaves[size_t(only)].node); }
+            if (on(2)) { leaves[size_t(only)].node = place(std::move(leaves[size_t(only)].node), t); leaves[size_t(only)].cols = estimate(leaves[size_t(only)].node, frames - 1); }
             else above.push_back(t);
         }
         size_t count = leaves.size();
@@ -445,28 +477,29 @@ struct Optimizer {
         for (const Leaf& l : leaves) { firstCol.push_back(allCols.size()); allCols.insert(allCols.end(), l.cols.begin(), l.cols.end()); }
         for (Pred& p : preds) bindCond(p.cond, colsOf(allCols));
         std::map<uint32_t, LogicalNode> best;
-        std::map<uint32_t, std::vector<int>> applied;
         for (size_t i = 0; i < count; i++) {
             best[1u << i] = leaves[i].node;
             dpTable.push_back(subsetName(1u << i, leaves) + "  rows=" + std::to_string((long long)leaves[i].node.rows) + " pages=" + std::to_string((long long)leaves[i].node.pages) +
                               "  * " + (accessPath(leaves[i].node) ? "access path" : "subquery") + "  cost=" + std::to_string((long long)leaves[i].node.total));
         }
-        // a subset whose relations the predicates do not connect would need a cross product; it is skipped
-        // when the whole query is connected, because then a plan without cross products exists
-        auto connectedSet = [&](uint32_t mask) {
-            uint32_t reached = mask & (~mask + 1);
-            for (bool grew = true; grew;) {
-                grew = false;
-                for (const Pred& p : preds)
-                    if ((p.leaves & mask) == p.leaves && (p.leaves & reached) && (p.leaves & ~reached)) { reached |= p.leaves; grew = true; }
+        // a predicate joins leaf r to the rest of a subset when its leaves are in the subset and include r and
+        // another one, so a predicate over k leaves is applied at the first join that has all k
+        auto joins = [&](const Pred& p, uint32_t mask, size_t r) { return (p.leaves & mask) == p.leaves && (p.leaves >> r & 1) && (p.leaves & mask & ~(1u << r)); };
+        // the subsets a left-deep plan can build without a cross product. When the whole query is one, the others
+        // are skipped. Otherwise (two parts with no predicate between them, or a link only through a predicate
+        // over three or more leaves) every subset is built, with a cross product where no predicate joins
+        std::vector<bool> withoutCross(size_t(all) + 1, false);
+        for (uint32_t mask = 1; mask <= all; mask++)
+            for (size_t r = 0; r < count; r++) {
+                uint32_t rest = mask & ~(1u << r);
+                if ((mask >> r & 1) && (!rest || (withoutCross[rest] && std::any_of(preds.begin(), preds.end(), [&](const Pred& p) { return joins(p, mask, r); })))) withoutCross[mask] = true;
             }
-            return reached == mask;
-        };
-        bool connectedQuery = connectedSet(all);
+        bool connectedQuery = withoutCross[all];
         for (size_t size = 2; size <= count; size++) {
+            int joinMemory = size == count ? memory : frames - 1;
             for (uint32_t mask = 1; mask <= all; mask++) {
                 if (size_t(__builtin_popcount(mask)) != size) continue;
-                if (connectedQuery && !connectedSet(mask)) { dpTable.push_back(subsetName(mask, leaves) + "  no join predicate connects it, skipped"); continue; }
+                if (connectedQuery && !withoutCross[mask]) { dpTable.push_back(subsetName(mask, leaves) + "  no join predicate connects it, skipped"); continue; }
                 double rows = 1;
                 for (size_t i = 0; i < count; i++) if (mask >> i & 1) rows *= leaves[i].node.rows;
                 for (const Pred& p : preds) if ((p.leaves & mask) == p.leaves) rows *= selectivity(p.cond, allCols);
@@ -477,8 +510,7 @@ struct Optimizer {
                     uint32_t rest = mask & ~(1u << r);
                     if (!(mask >> r & 1) || !best.count(rest)) continue;
                     std::vector<int> joining;
-                    for (size_t p = 0; p < preds.size(); p++)
-                        if ((preds[p].leaves & mask) == preds[p].leaves && (preds[p].leaves >> r & 1) && (preds[p].leaves & rest)) joining.push_back(int(p));
+                    for (size_t p = 0; p < preds.size(); p++) if (joins(preds[p], mask, r)) joining.push_back(int(p));
                     connected = connected || !joining.empty();
                     bool equi = !joining.empty() && std::all_of(joining.begin(), joining.end(), [&](int p) {
                         const Node& c = preds[size_t(p)].cond;
@@ -489,12 +521,11 @@ struct Optimizer {
                     for (const char* alg : {"nested_loop_join", "hash_join", "sort_merge_join"}) {
                         if (std::string(alg) != "nested_loop_join" && !equi) continue;
                         const LogicalNode &outer = best[rest], &inner = leaves[r].node;
-                        double cost = joinCost(alg, outer, inner) + (accessPath(outer) ? 0 : outer.total) + (accessPath(inner) ? 0 : inner.total);
+                        double cost = joinCost(alg, outer, inner, joinMemory) + (accessPath(outer) ? 0 : outer.total) + (accessPath(inner) ? 0 : inner.total);
                         candidates.push_back({rest, int(r), alg, cost, joining});
                     }
                 }
                 if (connected) candidates.erase(std::remove_if(candidates.begin(), candidates.end(), [](const Candidate& c) { return c.preds.empty(); }), candidates.end());
-                if (candidates.empty()) continue;
                 size_t winner = 0;
                 for (size_t c = 1; c < candidates.size(); c++) if (candidates[c].cost < candidates[winner].cost) winner = c;
                 const Candidate& w = candidates[winner];
@@ -507,7 +538,7 @@ struct Optimizer {
                 std::vector<ColumnInfo> cols;
                 for (size_t i = 0; i < count; i++) if (mask >> i & 1) cols.insert(cols.end(), leaves[i].cols.begin(), leaves[i].cols.end());
                 j.pages = pagesFor(j.rows, cols);
-                j.cost = joinCost(w.algorithm, j.kids[0], j.kids[1]);
+                j.cost = joinCost(w.algorithm, j.kids[0], j.kids[1], joinMemory);
                 j.total = w.cost;
                 for (size_t c = 0; c < candidates.size(); c++) {
                     const Candidate& k = candidates[c];
@@ -521,15 +552,15 @@ struct Optimizer {
         if (!above.empty()) result = wrapSelect(std::move(result), conjunction(above));
         return result;
     }
-    LogicalNode reorder(LogicalNode n) {
+    LogicalNode reorder(LogicalNode n, int memory) {
         bool block = n.op == "join" || n.op == "cross";
         if (n.op == "select") {
             const LogicalNode* below = &n.kids[0];
             while (below->op == "select") below = &below->kids[0];
             block = below->op == "join" || below->op == "cross";
         }
-        if (block) return joinBlock(std::move(n));
-        for (LogicalNode& k : n.kids) k = reorder(std::move(k));
+        if (block) return joinBlock(std::move(n), memory);
+        for (LogicalNode& k : n.kids) k = reorder(std::move(k), memoryBelow(n, memory));
         return n;
     }
 
@@ -617,11 +648,11 @@ struct Optimizer {
 
     LogicalNode optimize(LogicalNode n) {
         n = pushSelects(std::move(n));
-        n = reorder(std::move(n));
+        n = reorder(std::move(n), frames);
         std::vector<Col> all = outputCols(n);
         n = prune(std::move(n), all);
         n = tidy(std::move(n));
-        estimate(n);
+        estimate(n, frames);
         return n;
     }
     // no optimizer at all: joins as written, nested loops throughout, sort based grouping, nothing moved

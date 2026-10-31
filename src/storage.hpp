@@ -17,6 +17,7 @@ inline void layout(Database& db, Table& t, uint32_t pageNo, std::ostream& out) {
         const uint8_t* dir = db.pool.fetch({t.file, dirNo});
         uint32_t next = nextDirPage(dir);
         db.pool.unpin({t.file, dirNo}, false);
+        checkLink(db.disk, t.file, dirNo, next);
         directory = dirNo == pageNo;
         dirNo = next;
     }
@@ -60,31 +61,29 @@ inline std::vector<uint32_t> readTrace(const std::string& text) {
 }
 // fetches each page and unpins it clean straight away, on a scratch file large enough for every id
 inline PoolStats runTrace(const std::string& dir, const std::vector<uint32_t>& ids, int frames, Policy policy) {
-    std::filesystem::create_directories(dir);
     DiskManager disk;
-    uint32_t file = disk.createTemp(dir);
+    BufferPool pool(disk, frames, policy);
+    createDirectories(dir);
+    TempFile scratch(disk, dir);
     uint32_t largest = 0;
     for (uint32_t id : ids) largest = std::max(largest, id);
-    disk.truncate(file, ids.empty() ? 0 : largest + 1);
-    BufferPool pool(disk, frames, policy);
-    for (uint32_t id : ids) { pool.fetch({file, id}); pool.unpin({file, id}, false); }
-    PoolStats s = pool.stats();
-    disk.remove(file);
-    return s;
+    disk.truncate(scratch.file, ids.empty() ? 0 : largest + 1);
+    for (uint32_t id : ids) { pool.fetch({scratch.file, id}); pool.unpin({scratch.file, id}, false); }
+    return pool.stats();
 }
 
 inline int storageTool(const std::vector<std::string>& args, std::ostream& out) {
     const char* usage =
-        "usage: storage create-table --db DIR --name R --schema \"a:INT,b:VARCHAR(20)\"\n"
+        "usage: storage create-table --db DIR --name R --schema \"a:INT,b:VARCHAR(20)\" [--frames B]\n"
         "       storage load   --db DIR --table R --file r.csv [--frames B]\n"
         "       storage scan   --db DIR --table R [--frames B] [--limit N] [--policy lru|clock] [--json]\n"
-        "       storage layout --db DIR --table R --page P\n"
+        "       storage layout --db DIR --table R --page P [--frames B]\n"
         "       storage trace  --db DIR --file trace.txt [--frames B] [--policy lru|clock] [--json]\n";
     try {
         Args a = parseArgs(args, {"json"});
         if (a.command == "create-table") {
-            a.allow({"db", "name", "schema"});
-            Database db(a.need("db"), 8);
+            a.allow({"db", "name", "schema", "frames"});
+            Database db(a.need("db"), a.number("frames", 8));
             Table& t = db.createTable(a.need("name"), parseSchema(a.need("schema")));
             out << "created table " << t.name << " (";
             for (size_t i = 0; i < t.cols.size(); i++) out << (i ? ", " : "") << t.cols[i].name << ' ' << typeName(t.cols[i]);
@@ -92,19 +91,19 @@ inline int storageTool(const std::vector<std::string>& args, std::ostream& out) 
         }
         else if (a.command == "load") {
             a.allow({"db", "table", "file", "frames"});
-            Database db(a.need("db"), a.number("frames", 64));
-            Table& t = db.table(a.need("table"));
-            long rows = loadCsv(db, t, readFile(a.need("file")));
+            std::unique_ptr<Database> db = openDatabase(a.need("db"), a.number("frames", 64));
+            Table& t = db->table(a.need("table"));
+            long rows = loadCsv(*db, t, readFile(a.need("file")));
             out << "loaded " << rows << " rows into " << t.name << ", now " << t.liveTuples << " tuples on " << t.dataPages << " data pages\n";
         }
         else if (a.command == "scan") {
             a.allow({"db", "table", "frames", "limit", "policy", "json"});
             int limit = a.options.count("limit") ? a.number("limit", 0) : -1;
-            Database db(a.need("db"), a.number("frames", 64), policyNamed(a.get("policy", "lru")));
-            Table& t = db.table(a.need("table"));
+            std::unique_ptr<Database> db = openDatabase(a.need("db"), a.number("frames", 64), policyNamed(a.get("policy", "clock")));
+            Table& t = db->table(a.need("table"));
             std::vector<Row> rows;
             {
-                HeapScan scan(db.pool, t.file);
+                HeapScan scan(db->pool, t.file);
                 Rid rid;
                 std::string_view record;
                 while ((limit < 0 || long(rows.size()) < limit) && scan.next(rid, record)) rows.push_back(decode(t.cols, record));
@@ -112,25 +111,24 @@ inline int storageTool(const std::vector<std::string>& args, std::ostream& out) 
             if (a.has("json")) {
                 Json rowsJson = jsonArray();
                 for (const Row& r : rows) rowsJson.push(rowJson(r));
-                out << dumpJson(jsonObject().add("table", jsonString(t.name)).add("schema", schemaJson(t.cols, false)).add("rows", rowsJson).add("stats", statsJson(db.pool.stats()))) << '\n';
+                out << dumpJson(jsonObject().add("table", jsonString(t.name)).add("schema", schemaJson(t.cols, false)).add("rows", rowsJson).add("stats", statsJson(db->pool.stats()))) << '\n';
             } else {
                 for (size_t i = 0; i < t.cols.size(); i++) out << (i ? ", " : "") << t.cols[i].name;
                 out << '\n';
                 for (const Row& r : rows) out << rowText(r) << '\n';
-                out << rows.size() << " rows, " << statsText(db.pool.stats()) << '\n';
+                out << rows.size() << " rows, " << statsText(db->pool.stats()) << '\n';
             }
         }
         else if (a.command == "layout") {
-            a.allow({"db", "table", "page"});
+            a.allow({"db", "table", "page", "frames"});
             a.need("page");
-            Database db(a.need("db"), 8);
-            layout(db, db.table(a.need("table")), uint32_t(a.number("page", 0)), out);
+            std::unique_ptr<Database> db = openDatabase(a.need("db"), a.number("frames", 8));
+            layout(*db, db->table(a.need("table")), uint32_t(a.number("page", 0)), out);
         }
         else if (a.command == "trace") {
             a.allow({"db", "file", "frames", "policy", "json"});
-            std::string policy = a.get("policy", "lru");
+            std::string policy = a.get("policy", "clock");
             int frames = a.number("frames", 16);
-            if (frames < 1) throw Error{"error: --frames must be at least 1"};
             PoolStats s = runTrace(a.need("db"), readTrace(readFile(a.need("file"))), frames, policyNamed(policy));
             if (a.has("json"))
                 out << dumpJson(jsonObject().add("policy", jsonString(policy)).add("frames", jsonNumber(frames)).add("hits", jsonNumber((long long)s.hits)).add("misses", jsonNumber((long long)s.misses))
@@ -144,5 +142,7 @@ inline int storageTool(const std::vector<std::string>& args, std::ostream& out) 
         return 0;
     } catch (const Error& e) {
         return report(e, out);
+    } catch (const std::exception& e) {
+        return report(Error{std::string("internal error: ") + e.what()}, out);
     }
 }

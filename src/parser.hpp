@@ -1,28 +1,7 @@
-// parse tree nodes, the recursive descent parser and the tree printer
+// the recursive descent parser, one method per grammar rule
 #pragma once
-#include "lexer.hpp"
-#include <algorithm>
-#include <ostream>
-#include <utility>
+#include "tree.hpp"
 
-struct Value { bool isNum; double num; std::string text; };
-
-// Select to Join keep their parameter in kids[0]
-enum Kind { Relation, Union, Intersect, Minus, Times, Select, Project, Rename, Join, List, And, Or, Not, Eq, Ne, Lt, Le, Gt, Ge, Attr, NumLit, StrLit };
-const char* const NAME[] = {"Relation", "Union", "Intersect", "Minus", "Times", "Select", "Project", "Rename", "Join", "List", "And", "Or", "Not", "Eq", "Ne", "Lt", "Le", "Gt", "Ge", "Attr", "Num", "Str"};
-
-struct Node { Kind kind; Value val; size_t idx = 0; int line = 0, col = 0, depth = 1; std::vector<Node> kids; };
-
-// builds a node, refuses trees deeper than 500 so evaluation can't overflow the stack
-template <class... K> Node mk(Kind k, const Token& t, K... kids) {
-    Node n{k, {t.kind == Num, t.kind == Num ? toNum(t.text, t.line, t.col) : 0, t.text}, 0, t.line, t.col, 1, {}};
-    (n.kids.push_back(std::move(kids)), ...);
-    for (const Node& kid : n.kids) n.depth = std::max(n.depth, kid.depth + 1);
-    if (n.depth > 500) throw Error{"syntax error: nesting too deep", t.line, t.col};
-    return n;
-}
-
-// one method per grammar rule
 struct Parser {
     std::vector<Token> toks; size_t p = 0; int depth = 0;
     static std::string shown(const Token& t) { return t.kind == End ? t.text : t.kind == Str ? "string " + quoted(t.text) : "'" + t.text + "'"; }
@@ -53,6 +32,7 @@ struct Parser {
         if (accept("select")) return unary(Select, t);
         if (accept("project")) return unary(Project, t);
         if (accept("rename")) return unary(Rename, t);
+        if (accept("distinct")) { enter(t); expect("("); Node e = expr(); expect(")"); depth--; return mk(Distinct, t, std::move(e)); }
         if (accept("(")) { enter(t); Node e = expr(); expect(")"); depth--; return e; }
         return mk(Relation, ident("relation name"));
     }
@@ -92,28 +72,6 @@ struct Parser {
     }
 };
 
-// tree printer
-inline std::string oneLine(const Node& n) {
-    if (n.kind == StrLit) return "Str(" + quoted(n.val.text) + ")";
-    if (n.kind == List) { std::string s = "["; for (size_t i = 0; i < n.kids.size(); i++) s += (i ? ", " : "") + n.kids[i].val.text; return s + "]"; }
-    if (n.kids.empty()) return std::string(NAME[n.kind]) + "(" + n.val.text + ")";
-    std::string s = std::string(NAME[n.kind]) + "(";
-    for (size_t i = 0; i < n.kids.size(); i++) s += (i ? ", " : "") + oneLine(n.kids[i]);
-    return s + ")";
-}
-inline std::string label(const Node& n) {
-    std::string s = NAME[n.kind];
-    if (n.kind == Relation) return s + "(" + n.val.text + ")";
-    if (n.kind == Rename) return s + "(name=" + n.kids[0].val.text + ")";
-    if (n.kind == Project) return s + "(attrs=" + oneLine(n.kids[0]) + ")";
-    if (n.kind == Select || n.kind == Join) return s + "(cond=" + oneLine(n.kids[0]) + ")";
-    return s;
-}
-inline void printTree(const Node& n, std::ostream& out, const std::string& prefix = "") {
-    out << label(n) << '\n';
-    for (size_t i = n.kind >= Select && n.kind <= Join ? 1 : 0; i < n.kids.size(); i++) {
-        bool last = i + 1 == n.kids.size();
-        out << prefix << (last ? "└── " : "├── ");
-        printTree(n.kids[i], out, prefix + (last ? "    " : "│   "));
-    }
-}
+inline Node parseQuery(const std::string& text) { return Parser{tokenize(text)}.query(); }
+// the condition language on its own, as used inside select[...] and join[...]
+inline Node parseCondition(const std::string& text) { Parser p{tokenize(text)}; Node c = p.cond(); p.done(); return c; }

@@ -54,6 +54,7 @@ Product  = Primary , { ( "times" | "join" , "[" , Cond , "]" ) , Primary } ;
 Primary  = "select" , "[" , Cond , "]" , "(" , Expr , ")"
          | "project" , "[" , AttrList , "]" , "(" , Expr , ")"
          | "rename" , "[" , IDENT , "]" , "(" , Expr , ")"
+         | "distinct" , "(" , Expr , ")"                       (* added in Project 2 *)
          | "(" , Expr , ")"
          | IDENT ;
 AttrList = Attr , { "," , Attr } ;                             (* at least one attribute *)
@@ -85,7 +86,7 @@ number, `'32'` is a string, `D-1` and `2024-01-01` are strings, and anything con
 space, a parenthesis or a quote must be quoted, which is the rule in section 4.1 of the assignment.
 Two more cases follow from the line rules rather than from the assignment: a bare value may not start
 with `//` (the line would be a comment) and may not be exactly `}` (the line would close the relation);
-quote them. A relation is a set: duplicate tuples collapse to one when the file is loaded.
+quote them. Since Project 2 a relation is a bag: a tuple written twice is loaded twice.
 
 ### 1.5 Keywords (test case 8)
 
@@ -94,7 +95,7 @@ as a keyword only in the position where the grammar expects that keyword:
 
 | word | is a keyword only... | grammar rule |
 |---|---|---|
-| `select` `project` `rename` | at the start of a Primary | Primary |
+| `select` `project` `rename` `distinct` | at the start of a Primary | Primary |
 | `union` `minus` | after a complete Inter | Expr |
 | `intersect` | after a complete Product | Inter |
 | `times` `join` | after a complete Primary | Product |
@@ -104,7 +105,7 @@ as a keyword only in the position where the grammar expects that keyword:
 
 Everywhere else a word is an identifier. `select[union=3](R)` therefore parses with an attribute
 called `union`, because Operand never expects a keyword. Two consequences follow from the table and
-are deliberate: a relation named `select`, `project` or `rename` cannot be queried (the word is taken
+are deliberate: a relation named `select`, `project`, `rename` or `distinct` cannot be queried (the word is taken
 as an operator), and an attribute named `not` cannot start a comparison (`select[not=3](R)` is a
 syntax error, `select[3=not](R)` is fine). Keywords are lowercase and identifiers are case sensitive.
 
@@ -135,7 +136,7 @@ The parser's loop builds the node for each repetition with the accumulated left 
 | 2 | `not` | right (prefix, `not not c` is `not (not c)`) | NotC |
 | 3 | `and` | left | AndC |
 | 4 | `or` | left | Cond |
-| 5 | `( Expr )`, `select[...]`, `project[...]`, `rename[...]`, relation name | none (each is self delimiting) | Primary |
+| 5 | `( Expr )`, `select[...]`, `project[...]`, `rename[...]`, `distinct(...)`, relation name | none (each is self delimiting) | Primary |
 | 6 | `times`, `join[...]` | left | Product |
 | 7 | `intersect` | left | Inter |
 | 8 (loosest) | `union`, `minus` | left | Expr |

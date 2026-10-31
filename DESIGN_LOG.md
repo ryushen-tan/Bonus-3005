@@ -159,3 +159,38 @@ Goal: make sure every number and every explanation in REPORT.md comes from a mea
 - Two statements in this log were wrong about the tuple scanner bug in session 3. It dropped the first
   character of each value, not the second. Line 12 failed because it has a one-character value, not a
   quote. Corrected above.
+
+# Project 2
+
+## 2026-10-30, session 8: week one, the engine becomes a library
+
+Goal: the seven points of section 1.3 of the Project 2 handout, so the storage engine, the executor,
+the SQL front end and the optimizer can all reach into this code.
+
+1. Separate the layers. `engine.hpp` held the operators, the output and the loader together, and
+   `parser.hpp` held the tree with the parser. Now there are four headers that can be included on their
+   own: `lexer.hpp` (tokens), `tree.hpp` (nodes, the tree printer, conditions as text), `parser.hpp`
+   (the grammar) and `algebra.hpp` (the operators). None of them prints to standard output or opens a
+   file: the printers take a stream, the loader in `datafile.hpp` takes the text, and only `run.hpp`
+   touches files.
+2. The condition parser is exposed as `parseCondition(text)`, and `eval(cond, row)` evaluates it against
+   one tuple after `bindCond` has resolved the attributes and type checked the comparisons.
+3. Qualified names already worked everywhere in Bonus 1 (`Rel.name` must match exactly, an unqualified
+   name must match one attribute). Nothing to change except that an attribute may now belong to no
+   relation (an aggregate output like `n`), which `qualified()` prints as just the name.
+4. The tree is written as the logical plan JSON of Module 3 (`scan`, `select`, `project`, `rename`,
+   `join`, `cross`, `union`, `intersect`, `except`, `distinct`) by `treeToJson` and read back by
+   `jsonToTree`. Conditions travel as text written by `condText`, which adds parentheses only where the
+   grammar needs them, so `a = 1 or (b = 2 or c = 3)` keeps its right-nested shape. The JSON reader is
+   hand written (`json.hpp`) and reports the line and column of a syntax error. The test round-trips
+   fifteen queries covering every node and every comparison operator, and checks that writing the
+   read-back tree gives byte-identical JSON.
+5. The engine no longer owns a `std::map` of relations. It is given a `source` function that returns a
+   relation by name; the command line passes one backed by the data file.
+6. Bags. `project` keeps duplicates, loading keeps a tuple written twice, and `distinct(e)` is a new
+   operator in the grammar. `union`, `intersect` and `minus` stay set operations, matching what SQL's
+   `UNION`, `INTERSECT` and `EXCEPT` mean.
+7. All 25 cases still pass except case 23, whose meaning changed: `project[DID](Employees)` returned
+   `D1, D2` under sets and now returns `D1, D1, D2`. The old answer is `distinct(project[DID](Employees))`,
+   added as 23b. Among the extras, x29 (duplicates in a file were collapsed, now kept), x39, x40 and x48
+   (projections after a join now show every matching pair) changed for the same reason. 122 of 122 pass.

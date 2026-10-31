@@ -1,14 +1,19 @@
 # Relational algebra query processor
 
 COMP 3005 bonus project 1. A hand-written tokenizer, a recursive descent parser, a parse tree
-printer, the six relational algebra operators with set semantics, a data generator and a
-performance study, in C++17 with no dependencies beyond the standard library.
+printer, the six relational algebra operators, a data generator and a performance study, in C++17
+with no dependencies beyond the standard library. Project 2 turned it into the library the database
+system is built on: relations are bags, `distinct` is its own operator, and the tree reads and writes
+the JSON plan format (see the Project 2 section at the end).
 
 | file | contents |
 |---|---|
 | `src/lexer.hpp` | tokens and the character by character scanner |
-| `src/parser.hpp` | parse tree nodes, one method per grammar rule, the tree printer |
-| `src/engine.hpp` | relations, tuple order and equality, binding, evaluation, the operators, output, loading |
+| `src/tree.hpp` | parse tree nodes, the tree printer, conditions written back as text |
+| `src/parser.hpp` | one method per grammar rule; `parseQuery` and `parseCondition` |
+| `src/algebra.hpp` | relations as bags, tuple order and equality, binding, evaluation, the operators |
+| `src/datafile.hpp` | loading relation definition files and printing relations |
+| `src/treejson.hpp`, `src/json.hpp` | the tree as plan JSON and back; the JSON reader and writer |
 | `src/run.hpp` | the command line, shared by the program and the tests |
 | `src/ra.cpp` | `main` |
 | `src/gen.cpp` | data generator for the performance study |
@@ -30,6 +35,7 @@ make perf       runs the experiment, writes perf/results.tsv and perf/time.svg, 
 
 ```
 ./ra --tree "<query>"                    print the parse tree, nothing is executed
+./ra --json "<query>"                    print the tree as logical plan JSON
 ./ra --tokens "<query>"                  print the token stream as  kind text (line:col)
 ./ra <datafile> "<query>"                load the relations, run the query, print the result
 ./ra --tree <datafile> "<query>"         both
@@ -92,18 +98,19 @@ a parenthesis or a quote must be quoted with single quotes, and `''` inside quot
 (`'O''Brien'`). A bare value is a number if it looks like one (`32`, `-30`, `2.5`), otherwise it is a
 string (`E1`, `D-1`, `2024-01-01`); `'32'` is a string. Two more values need quotes because of the
 line rules: a value that starts with `//` and the single character `}`. Numbers must fit in a double.
-A relation is a set, so duplicate tuples in a file collapse to one.
+A relation is a bag, so a tuple written twice is there twice.
 
 ### Semantics
 
 | operator | output schema and behaviour |
 |---|---|
 | `select[c](e)` | same schema as `e`; `c` may compare two attributes |
-| `project[a, b](e)` | the listed attributes in the listed order, duplicates removed; listing the same attribute twice is a schema error |
+| `project[a, b](e)` | the listed attributes in the listed order, duplicates kept; listing the same attribute twice is a schema error |
+| `distinct(e)` | same schema as `e`, duplicate tuples removed |
 | `rename[X](e)` | same attributes, now belonging to relation `X`; a schema error if two attributes would then share a name |
 | `e times f` | all attributes of both, each remembered with its relation name; a duplicate qualified name is a schema error |
 | `e join[c] f` | `times` followed by `select[c]`, evaluated pair by pair without building the product; the comparison counter is the same for both spellings |
-| `union`, `intersect`, `minus` | schema of the left input; the inputs must have the same number of attributes, the same names in the same order (relation qualifiers are ignored) and the same type in each position; the unknown type of an empty relation matches either type and the result column takes the other side's type |
+| `union`, `intersect`, `minus` | set semantics, the result has no duplicates; schema of the left input; the inputs must have the same number of attributes, the same names in the same order (relation qualifiers are ignored) and the same type in each position; the unknown type of an empty relation matches either type and the result column takes the other side's type |
 
 Every attribute is `(relation, name, type)`. A base relation's attributes belong to it; `rename`
 changes the relation of all of them; `times` and `join` keep both sides' relation names. In a

@@ -41,7 +41,8 @@ const Case CASES[] = {
      "E2.EID, E2.Name, E2.MgrID, E2.DID, Emp.EID, Emp.Name, Emp.MgrID, Emp.DID\nE1, John, E3, D1, E2, Alice, E1, D2\nE3, Bob, E0, D1, E1, John, E3, D1\n", 0, 9},
     {"21 incompatible union", {F, "R union S"}, "schema error: union inputs are not union compatible: different number of attributes at line 1 col 3\n", 1},
     {"22 number against string", {F, "select[Age>'30'](R)"}, "type error: cannot compare number Age with string '30' at line 1 col 11\n", 1},
-    {"23 project removes duplicates", {F, "project[DID](Employees)"}, "DID\nD1\nD2\n"},
+    {"23 project keeps duplicates (bags since Project 2)", {F, "project[DID](Employees)"}, "DID\nD1\nD1\nD2\n"},
+    {"23b distinct gives the Bonus 1 answer back", {F, "distinct(project[DID](Employees))"}, "DID\nD1\nD2\n"},
     {"24 duplicate projection", {F, "project[Name, Name](R)"}, "schema error: duplicate attribute R.Name in project at line 1 col 1\n", 1},
     {"25 empty result", {F, "select[Age>100](Employees)"}, "EID, Name, Age, DID\n", 0, 3},
 
@@ -78,7 +79,7 @@ const Case CASES[] = {
     {"x28 empty query", {"--tree", ""}, "syntax error: expected relation name but found end of input at line 1 col 1\n", 1},
 
     // operators and schemas
-    {"x29 duplicates collapse on load", {F, "D"}, "x\n3\n4\n"},
+    {"x29 duplicates are kept on load", {F, "D"}, "x\n3\n3\n4\n"},
     {"x30 intersect", {F, "A intersect B"}, "x\n2\n3\n"},
     {"x31 minus to empty", {F, "A minus A"}, "x\n"},
     {"x32 union ignores qualifiers", {F, "rename[X](A) union A"}, "x\n1\n2\n3\n"},
@@ -88,8 +89,8 @@ const Case CASES[] = {
     {"x36 join is times then select", {F, "select[R.b=S.b](R times S)"}, JH + "1, 32, Bob, 1, 2, 4, 5, 5, 2, 10\n2, 28, 'Bob)', 1, 3, 2, 6, 7, 3, 20\n3, 30, 'a,b', 2, 2, 3, 8, 8, 2, 10\n", 0, 8},
     {"x37 counter sums over the tree", {F, "select[S.c>10](R join[R.b=S.b] S)"}, JH + "2, 28, 'Bob)', 1, 3, 2, 6, 7, 3, 20\n", 0, 11},
     {"x38 empty join", {F, "Emp join[Emp.DID=Dept.DName] Dept"}, "Emp.EID, Emp.Name, Emp.MgrID, Emp.DID, Dept.DID, Dept.DName\n", 0, 9},
-    {"x39 qualified project after join", {F, "project[Dept.DName](Emp join[Emp.DID=Dept.DID] Dept)"}, "DName\nEng\nSales\n", 0, 9},
-    {"x40 same name different relations", {F, "project[Emp.DID, Dept.DID](Emp join[Emp.DID=Dept.DID] Dept)"}, "Emp.DID, Dept.DID\nD1, D1\nD2, D2\n", 0, 9},
+    {"x39 qualified project after join", {F, "project[Dept.DName](Emp join[Emp.DID=Dept.DID] Dept)"}, "DName\nEng\nSales\nSales\n", 0, 9},
+    {"x40 same name different relations", {F, "project[Emp.DID, Dept.DID](Emp join[Emp.DID=Dept.DID] Dept)"}, "Emp.DID, Dept.DID\nD1, D1\nD1, D1\nD2, D2\n", 0, 9},
     {"x41 projection keeps listed order", {F, "project[Name, Age](Employees)"}, "Name, Age\nAlice, 28\nBob, 29\nJohn, 32\n"},
     {"x42 qualified name on a base relation", {F, "select[Employees.Age>30](Employees)"}, "EID, Name, Age, DID\nE1, John, 32, D1\n", 0, 3},
     {"x43 wrong qualifier", {F, "select[Foo.Age>30](Employees)"}, "name error: unknown attribute Foo.Age at line 1 col 8\n", 1},
@@ -97,7 +98,7 @@ const Case CASES[] = {
     {"x45 unknown attribute", {F, "select[zz=3](R)"}, "name error: unknown attribute zz at line 1 col 8\n", 1},
     {"x46 ambiguous attribute", {F, "select[c>0](R join[R.b=S.b] S)"}, "name error: ambiguous attribute c at line 1 col 8\n", 1},
     {"x47 times collides without rename", {F, "Emp times Emp"}, "schema error: duplicate attribute Emp.EID in times at line 1 col 5\n", 1},
-    {"x48 rename fixes the collision", {F, "project[M.Name](rename[M](Emp) times Emp)"}, "Name\nAlice\nBob\nJohn\n"},
+    {"x48 rename fixes the collision", {F, "project[M.Name](rename[M](Emp) times Emp)"}, "Name\nAlice\nAlice\nAlice\nBob\nBob\nBob\nJohn\nJohn\nJohn\n"},
     {"x49 rename can collide", {F, "rename[X](Emp join[Emp.DID=Dept.DID] Dept)"}, "schema error: duplicate attribute X.DID in rename at line 1 col 1\n", 1},
     {"x50 attribute against attribute of another type", {F, "select[Name=Age](R)"}, "type error: cannot compare string Name with number Age at line 1 col 12\n", 1},
     {"x51 tree and result together", {"--tree", F, "C"}, "Relation(C)\nx\n3\n"},
@@ -108,7 +109,7 @@ const Case CASES[] = {
     {"x54 mixed column types", {"tests/bad_type.txt", "R"}, "type error: attribute a of R mixes numbers and strings at line 3 col 1\n", 1},
     {"x55 bare value with a space", {"tests/bad_bare.txt", "R"}, "lexical error: bare value must be quoted at line 2 col 3\n", 1},
     {"x56 missing data file", {"nope.txt", "A"}, "io error: cannot open nope.txt\n", 1},
-    {"x57 usage", {}, "usage: ra [--tree] [--tokens] [--stats] [datafile] \"query\"\n", 2},
+    {"x57 usage", {}, "usage: ra [--tree] [--tokens] [--json] [--stats] [datafile] \"query\"\n", 2},
     {"x58 case 8 executed", {F, "select[union=3](K)"}, "union, x\n3, a\n", 0, 2},
     {"x59 comment and newline inside a query", {"--tree", "A // the rest of this line is ignored\n union B"}, "Union\n├── Relation(A)\n└── Relation(B)\n"},
     {"x60 500 nested parentheses parse", {"--tree", std::string(500, '(') + "R" + std::string(500, ')')}, "Relation(R)\n"},
@@ -121,8 +122,39 @@ const Case CASES[] = {
     {"x67 chain of 499 operators parses", {"A" + [] { std::string s; for (int i = 0; i < 499; i++) s += " union A"; return s; }()}, ""},
     {"x68 chain of 500 operators is too deep", {"A" + [] { std::string s; for (int i = 0; i < 500; i++) s += " union A"; return s; }()}, "syntax error: nesting too deep at line 1 col 3995\n", 1},
     {"x69 long condition chain is too deep not a crash", {F, "select[" + [] { std::string s; for (int i = 0; i < 600; i++) s += "a=1 and "; return s + "a=1](R)"; }()}, "syntax error: nesting too deep at line 1 col 3996\n", 1},
-    {"x70 unknown flag", {"--help"}, "usage: ra [--tree] [--tokens] [--stats] [datafile] \"query\"\n", 2},
+    {"x70 unknown flag", {"--help"}, "usage: ra [--tree] [--tokens] [--json] [--stats] [datafile] \"query\"\n", 2},
     {"x71 text after the closing brace", {"tests/bad_brace2.txt", "R"}, "syntax error: unexpected text after '}' at line 3 col 2\n", 1},
+
+    // bags
+    {"x72 distinct tree", {"--tree", "distinct(project[a](R))"}, "Distinct\n└── Project(attrs=[a])\n    └── Relation(R)\n"},
+    {"x73 union removes duplicates", {F, "D union D"}, "x\n3\n4\n"},
+    {"x74 intersect is a set", {F, "D intersect D"}, "x\n3\n4\n"},
+    {"x75 minus is a set", {F, "D minus C"}, "x\n4\n"},
+    {"x76 select keeps duplicates", {F, "select[x>2](D)"}, "x\n3\n3\n4\n", 0, 3},
+    {"x77 join keeps duplicates", {F, "D join[D.x=C.x] C"}, "D.x, C.x\n3, 3\n3, 3\n", 0, 3},
+    {"x78 distinct of a set changes nothing", {F, "distinct(A)"}, "x\n1\n2\n3\n"},
+    {"x79 json", {"--json", "project[R.a](select[a>1 and not b='x'](R))"},
+     "{\n  \"op\": \"project\",\n  \"columns\": [\"R.a\"],\n  \"child\": {\n    \"op\": \"select\",\n    \"condition\": \"a > 1 and not b = 'x'\",\n    \"child\": {\n      \"op\": \"scan\",\n      \"table\": \"R\"\n    }\n  }\n}\n"},
+    {"x80 distinct as a relation name is a keyword", {"--tree", "distinct"}, "syntax error: expected '(' but found end of input at line 1 col 9\n", 1},
+};
+
+// every node type and every condition operator, parenthesised the way condText must reproduce
+const char* const ROUND_TRIP[] = {
+    "R",
+    "distinct(R)",
+    "select[a = 1 and b != 'x''y' or not c < -2.5](R)",
+    "select[(a <= 1 or b >= 2) and c > 3](R)",
+    "select[a = 1 or (b = 2 or c = 3)](R)",
+    "select[not (a = 1 and b = 2)](R)",
+    "select[not not a = 1](R)",
+    "project[a, S.b](R)",
+    "rename[X](R)",
+    "R join[R.b = S.b] S",
+    "R times S",
+    "A union B minus C",
+    "A union (B minus C)",
+    "A intersect B",
+    "(A times B) join[A.x = C.x] (rename[Z](distinct(project[x](C))))",
 };
 
 int main() {
@@ -134,6 +166,28 @@ int main() {
         if (rc == c.code && o.str() == c.want && (c.cmp < 0 || (long long)e.comparisons == c.cmp)) continue;
         fails++;
         std::cout << "FAIL " << c.name << " (exit " << rc << ", comparisons " << e.comparisons << ")\n--- want ---\n" << c.want << "--- got ---\n" << o.str();
+    }
+    // tree -> json -> tree gives the same tree, and writing it again gives the same json
+    for (const char* q : ROUND_TRIP) {
+        total++;
+        Node tree = parseQuery(q);
+        std::string json = dumpJson(treeToJson(tree));
+        Node back = jsonToTree(parseJson(json));
+        std::ostringstream want, got;
+        printTree(tree, want);
+        printTree(back, got);
+        if (want.str() == got.str() && dumpJson(treeToJson(back)) == json && oneLine(tree) == oneLine(back)) continue;
+        fails++;
+        std::cout << "FAIL round trip " << q << "\n" << json << "\n--- want ---\n" << want.str() << "--- got ---\n" << got.str();
+    }
+    // the condition parser on its own, evaluated against one tuple
+    {
+        total++;
+        std::vector<Col> cols = {{"R", "b", RealT}, {"S", "b", RealT}, {"S", "name", StrT}};
+        Node c = parseCondition("R.b = S.b and S.name != 'x'");
+        bindCond(c, cols);
+        Row match = {{true, 2, "2"}, {true, 2, "2.0"}, {false, 0, "y"}}, miss = {{true, 2, "2"}, {true, 3, "3"}, {false, 0, "y"}};
+        if (!eval(c, match) || eval(c, miss)) { fails++; std::cout << "FAIL condition parser on its own\n"; }
     }
     std::cout << total - fails << "/" << total << " passed\n";
     return fails != 0;

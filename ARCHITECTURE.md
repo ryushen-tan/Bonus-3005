@@ -87,6 +87,87 @@ write that input to a temporary file (DESIGN_M4.md section 4). A group_by with n
 hash grouping is sized as M2 packs it, each group at its declared length with a slot. Where M2 spends
 I/O the formulas do not count, that is measured in REPORT_M2.md rather than hidden.
 
+## C++ implementation decisions
+
+**C++17, standard library and POSIX only, header files with one `.cpp` per tool.** Every tool is a
+single translation unit (`src/storage.cpp` is three lines: include `storage.hpp`, call `storageTool`), so
+the `Makefile` needs no link step and no build system, and a test file includes exactly the headers of
+the module it tests. The cost is that changing any header rebuilds every tool. The build uses `-Wall -Wextra -Werror`, so a warning is a failed build.
+
+**Every tool is a function of its arguments and an `std::ostream`.** `main` only forwards `argv` and
+`std::cout` to `storageTool`, `execTool` and the rest. The tests call the same functions with an
+`std::ostringstream` and compare the whole output byte for byte, so they need no shell and no
+subprocess, and what the tests check is exactly what the tool prints.
+
+**Errors are one exception type, `Error { msg, line, col }`** (`lexer.hpp`). Every module throws it,
+and each tool catches it once, at the top, and prints one line through `report`. A second
+`catch (const std::exception&)` turns anything else (`std::bad_alloc`, `std::invalid_argument` from
+`std::stoll`) into one `internal error:` line instead of an abort. Error codes would have had to be
+checked at every one of the hundreds of places that can fail, and the position travels with the
+exception from the scanner to the message.
+
+**Resources are owned by objects, so an exception cannot leak a pin, a frame or a file (RAII).**
+- `Frames` (`exec.hpp`) holds the frames an operator reserved from the pool and releases them in its
+  destructor. It is non-copyable (`Frames(const Frames&) = delete`), so two owners cannot release the
+  same frame.
+- `HeapScan`, `RunReader` and `RunWriter` unpin or release their page in their destructors, and
+  `ChildSource` closes its child.
+- `TempFile` and `SpillFile` delete their temporary file in their destructors, which is why "no
+  temporary files remain" holds even when a plan fails part way.
+- `Charge` saves `DiskManager::attributed`, points it at the current operator's counters, and
+  restores it in its destructor. Every `open`, `next` and `close` makes one, so each page read or
+  written is charged to the operator that caused it, and nested operators restore their parent's
+  counters on the way out.
+- Where a function must unpin on failure and still rethrow, it does so explicitly
+  (`catch (...) { pool.unpin(...); throw; }` in `heap.hpp`).
+
+The "no pinned frames after any plan" checklist item comes from this rule, not from cleanup code at
+the end of `execute`.
+
+**Operators are a class hierarchy with the iterator interface as virtual functions.** `Operator`
+(`exec.hpp`) has non-virtual `open`, `next` and `close`, which make the `Charge` and count
+`tuplesOut`, and the subclasses override the virtual `start`, `produce` and `finish`. This is the
+non-virtual interface pattern: the counting cannot be forgotten by any of the fifteen operators,
+because none of them implements `next` itself. Children are
+`std::vector<std::unique_ptr<Operator>>`, built by `buildNode` (`plan.hpp`) with `std::make_unique`,
+so the plan tree owns its operators and destroying the root closes and frees everything. Virtual
+dispatch costs one indirect call per tuple per operator. Next to page I/O it is not measurable, and a
+template-based pipeline would have made the plan's shape a compile-time type when it is only known
+from JSON at run time.
+
+**Pages are bytes, encoded and decoded explicitly in little-endian.** `page.hpp` writes every integer
+with `put16` and `put32` and reads it with `get16` and `get32`, a byte at a time with shifts, never by
+casting a `uint8_t*` to a struct or an `int*`. This avoids undefined behaviour from misaligned access
+and strict aliasing, and makes the file format the same on any machine. A `REAL` is copied with
+`std::memcpy`, which is the defined way to move a `double`'s bytes. A frame is
+`std::array<uint8_t, PAGE_SIZE>`, held by value inside the pool's `std::vector<Frame>`, so the pool's
+memory is allocated once when it opens and never during a query.
+
+**Disk I/O is POSIX `pread` and `pwrite` on file descriptors, not `fstream`.** A page read is one
+system call at an explicit offset with no stream position and no library buffer, so the counters
+count exactly the reads and writes that happen. That is what makes the M1 checklist item "the same
+command twice gives identical counters" hold. New files are opened with `O_CREAT | O_EXCL`, so
+`create-table` cannot overwrite a file. The catalog is written to a `mkstemp` file and moved over
+`catalog.db` with `rename(2)`, which is atomic, so a crash leaves the old catalog or the new one,
+never half of each.
+
+**Trees are values.** A Bonus 1 `Node` holds its children as `std::vector<Node>`, and `LogicalNode` and
+`Json` do the same, so a tree is copied, moved and destroyed by the compiler-generated members with no
+pointers to manage. The optimizer's rewrite rules copy subtrees freely, which is cheap at plan sizes.
+The physical operators are the exception, because they are polymorphic and need `unique_ptr`.
+
+**Deep inputs run on a 1 GB stack.** The parsers, the optimizer's passes and the operators all recurse
+once per level of a plan. The deepest inputs `GRAMMAR_SQL.md` allows overflow the 8 MB stack of a main
+thread, so `onLargeStack` (`cli.hpp`) runs the tool on a `pthread` with `TOOL_STACK_BYTES` of stack.
+Past those limits, `mk` (`tree.hpp`) refuses a tree nested deeper than `MAX_DEPTH` or taller than
+`MAX_HEIGHT` with an `Error`, so an extreme input is an error message, not a stack overflow.
+
+**Containers are chosen for determinism.** The buffer pool's page table and the optimizer's DP table
+are `std::map`, ordered by key, so their iteration order, and with it the printed DP table, is the same
+on every run and every standard library. The DP table is indexed by a `uint32_t` bitmask
+of the relations in a subset (`best[1u << i]`), which caps a join at 32 relations, well above the SQL
+front end's limit of 16 tables in one FROM.
+
 ## What I would do differently
 
 **Decide the memory model in week one, not in Module 2.** The rule that only one operator holds memory

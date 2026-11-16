@@ -554,10 +554,12 @@ const std::vector<Test> TESTS = {
             db.saveCatalog();
         }
         std::ofstream(dir + "/plan.json") << scan("R");
+        std::string noConversion;
+        try { (void)std::stoll("abc"); } catch (const std::invalid_argument& e) { noConversion = e.what(); }
         std::ostringstream out;
         int code = execTool({"run", "--db", dir, "--plan", dir + "/plan.json"}, out);
         std::filesystem::remove_all(dir);
-        return code == 1 && out.str() == "internal error: stoll: no conversion\n" ? "" : out.str();
+        return code == 1 && out.str() == "internal error: " + noConversion + "\n" ? "" : out.str();
     }},
     {"plans that do not conform are rejected naming the node", [] {
         std::string got;

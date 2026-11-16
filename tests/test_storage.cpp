@@ -586,8 +586,10 @@ const Test TESTS[] = {
                           tool({"create-table", "--db", DIR, "--name", std::string(300, 'a'), "--schema", "a:INT"}) +
                           tool({"create-table", "--db", DIR, "--name", "R", "--schema", "a:VARCHAR(99999999999)"}) +
                           tool({"create-table", "--db", DIR, "--name", "R", "--schema", "a:VARCHAR(0000000000000000000255)"});
+        std::error_code notADirectory;
+        std::filesystem::create_directories(DIR + "/afile", notADirectory);
         std::string want = "error: " + DIR + "/afile is not a database, it has no catalog.db\n"
-                           "io error: cannot create directory " + DIR + "/afile: File exists\n"
+                           "io error: cannot create directory " + DIR + "/afile: " + notADirectory.message() + "\n"
                            "error: table name " + std::string(300, 'a') + " is longer than 252 characters, the most that leaves room for .db in a file name\n"
                            "error: bad schema \"a:VARCHAR(99999999999)\": VARCHAR length must be 1 to 255 at character 22\n"
                            "created table R (a VARCHAR(255)) in " + DIR + "/R.db\n";
@@ -602,9 +604,11 @@ const Test TESTS[] = {
             t.stats.columns[0] = {1, textValue("abc"), textValue("abc"), {}};
             db.saveCatalog();
         }
+        std::string noConversion;
+        try { (void)std::stoll("abc"); } catch (const std::invalid_argument& e) { noConversion = e.what(); }
         std::ostringstream out;
         int code = storageTool({"scan", "--db", DIR, "--table", "R"}, out);
-        return code == 1 && out.str() == "internal error: stoll: no conversion\n" ? "" : out.str();
+        return code == 1 && out.str() == "internal error: " + noConversion + "\n" ? "" : out.str();
     }},
     {"a scratch file is deleted however its scope is left", [] {
         fresh();

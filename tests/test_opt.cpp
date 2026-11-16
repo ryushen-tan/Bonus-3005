@@ -165,7 +165,7 @@ const std::vector<Test> TESTS = {
         dept.dataPages = 1;
         dept.stats = {true, 50, 1, 4, {{50, intValue(0), intValue(49), {}, 4}}};
         std::string got;
-        for (const std::string& sql : {"SELECT * FROM Emp WHERE did = 7;", "SELECT * FROM Emp WHERE age > 60;", "SELECT * FROM Emp WHERE did = 7 AND age > 60;", "SELECT * FROM Emp JOIN Dept ON Emp.did = Dept.did;"}) {
+        for (const std::string sql : {"SELECT * FROM Emp WHERE did = 7;", "SELECT * FROM Emp WHERE age > 60;", "SELECT * FROM Emp WHERE did = 7 AND age > 60;", "SELECT * FROM Emp JOIN Dept ON Emp.did = Dept.did;"}) {
             Optimizer o{db, 32, {}, {}};
             LogicalNode plan = o.optimize(compileSql(db, sql));
             got += std::to_string((long long)plan.rows) + " ";
@@ -281,7 +281,7 @@ const std::vector<Test> TESTS = {
     {"a sort below an operator that holds memory is costed with the B - 1 frames it gets", [] {
         Database db(DIR, 4);
         std::string problems;
-        for (const std::string& sql : {"SELECT k, pad FROM Wide ORDER BY k;", "(SELECT k, pad FROM Wide ORDER BY k) EXCEPT (SELECT k, pad FROM Wide WHERE k < 0);"}) {
+        for (const std::string sql : {"SELECT k, pad FROM Wide ORDER BY k;", "(SELECT k, pad FROM Wide ORDER BY k) EXCEPT (SELECT k, pad FROM Wide WHERE k < 0);"}) {
             Optimizer o{db, 4, {}, {}};
             LogicalNode plan = o.optimize(compileSql(db, sql));
             std::unique_ptr<Operator> root = buildPlan(db, physicalJson(plan));
@@ -442,7 +442,7 @@ const std::vector<Test> TESTS = {
             table(db, "G", "g:INT,name:VARCHAR(255),i:INT", rows);
             analyzeTable(db, db.table("G"), 20);
             // at these B no level is on the edge of fitting, where uneven partitions make some split and others not
-            for (const std::string& sql : {"SELECT g, MAX(name) FROM G GROUP BY g;", "SELECT DISTINCT g, i FROM G;"})
+            for (const std::string sql : {"SELECT g, MAX(name) FROM G GROUP BY g;", "SELECT DISTINCT g, i FROM G;"})
                 for (int b : {6, 8, 16}) {
                     Optimizer o{db, b, {}, {}};
                     LogicalNode plan = o.optimize(compileSql(db, sql));

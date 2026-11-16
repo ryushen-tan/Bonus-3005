@@ -1,4 +1,3 @@
-CXX = clang++
 CXXFLAGS = -std=c++17 -O2 -Wall -Wextra -Werror
 TOOLS = ra gen storage exec sql opt db
 TESTS = ratest storagetest exectest sqltest opttest

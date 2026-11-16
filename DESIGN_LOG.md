@@ -385,3 +385,26 @@ Left as they are, on purpose:
 - The optimizer's time grows with the square of a plan's depth, so the deepest allowed statements take minutes. Pretty-printed plans of that depth are gigabytes.
 - The hash grouping estimate is within 10% except near a level boundary, where uneven partitions make it up to about 30% off.
 - `sql check` doesn't catch two CREATE TABLEs in one script whose names differ only in case. The shell does.
+
+## 2026-11-15, session 17: getting ready for the hidden workload
+
+Goal: be able to load an unseen dataset, run 25 unseen queries and report each one, on a Linux machine, with the results checked against a PostgreSQL I don't control.
+
+What broke:
+
+1. The build failed on Linux. The `Makefile` named `clang++`, which a stock Ubuntu image doesn't have. With `make CXX=g++`, GCC's `-Wrange-loop-construct` turned three test loops into errors, because `const std::string&` bound to a temporary made from a string literal. Three tests also expected libc++'s wording of an error: `stoll: no conversion` (libstdc++ says `stoll`) and `File exists` from `create_directories` on a file (libstdc++ reports `Not a directory`). The program's behaviour was the same on both. Found by building in Docker with GCC 12.
+2. The check against PostgreSQL only agreed because of its locale. It made the cluster with `--locale=C`, which compares strings byte by byte as this engine does. Under `en_US`, PostgreSQL sorts `apple, Apple, Banana` where byte order gives `Apple, Banana, apple`, and `COUNT(*) WHERE name < 'b'` was 2 there and 3 here. The generated data never mixes case, so the 390 runs still agreed on an en-US server. Found with seven rows of mixed-case fruit.
+3. `CREATE DATABASE ... LOCALE 'C'` didn't fix it on a server whose default provider is ICU. That database still sorted by language. It needs `LOCALE_PROVIDER libc`.
+4. There was no way to run an unseen workload. `tests/e2e/run.py` and `perf/m4.py` were wired to the generated dataset and their own query files.
+
+What changed:
+
+- The `Makefile` uses the system's `c++`. The test loops copy the string. The three tests take the expected message from the same library call the program makes.
+- `perf/workload.py DATA_DIR queries.sql [--frames B] [--psql ...]` loads `schema.sql` and a CSV per table, runs ANALYZE, runs each query through the shell, and writes `perf/workload/report.md`. That has the rows, page I/O, time, estimated against actual rows and q-error, with each query's EXPLAIN ANALYZE beside it, and a PostgreSQL verdict per query. A result whose only difference is the order of tied rows is marked as that, not as a failure.
+- The PostgreSQL helpers moved into `perf/compare.py`, used by the workload runner, the end to end check and `perf/m4.py`. Loading PostgreSQL declares every VARCHAR column `COLLATE "C"`, so the comparison is the same on any server. The statement splitter now ignores semicolons inside string literals.
+
+Verification:
+
+- `make && make test` on stock Ubuntu 24.04 (its default g++, no clang) and on macOS: 340 of 340.
+- The end to end check against an en-US (ICU) PostgreSQL 17: 390 of 390 at scale 1.
+- A rehearsal: the 64 queries of `tests/e2e/queries.sql` and `perf/m4_queries.sql` on scale 20 data (82,200 rows) through `perf/workload.py`, against the en-US server. 64 of 64 agree at B = 32 and at B = 4. The whole run takes 10 to 13 seconds, and the slowest query 0.7 seconds. The worst root estimate is q-error 8.3 (889 estimated, 7409 actual), Emp joined to Works under `level = 8 AND salary > 160000`. Those two columns are correlated on purpose (REPORT_M4.md section 4), so independence puts the filter at 282 rows where 2467 pass.

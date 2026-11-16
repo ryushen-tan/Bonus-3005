@@ -21,7 +21,7 @@ This is COMP 3005 bonus project 1. It has a tokenizer, a recursive descent parse
 
 ## Build and run
 
-You need `clang++` (or `g++` with `make CXX=g++`) and GNU make.
+You need a C++17 compiler and GNU make. `make` uses the system's `c++`, which is clang on macOS and g++ on Linux, and both build with no warnings. `make CXX=clang++` or `make CXX=g++` picks one.
 
 ```
 make            builds every tool: ./ra and ./gen (Bonus 1), ./storage ./exec ./sql ./opt and ./db (Project 2)
@@ -201,6 +201,16 @@ opt plan ... --baseline                      the unoptimised plan;  --without-ru
 Tests (`make test`): `tests/test.cpp` has the 25 Bonus 1 cases under bag semantics, plus a JSON round trip of every node type. `tests/test_storage.cpp` has M1's worked examples, error table and checklist. `tests/test_exec.cpp` has M2's examples and checklist, and 64 plans checked against the Bonus 1 engine at B = 4, 5, 8 and 64. `tests/test_sql.cpp` has M3's seven examples and fifteen cases. `tests/test_opt.cpp` has M4's examples and checklist, SQL run through all four modules optimised and unoptimised, and the `db` shell's commands and error positions. `python3 tests/e2e/run.py SCALE "psql connection args"` runs 44 queries through the four tools chained by file, optimised and unoptimised, and through the `db` shell, at B = 4, 8 and 32. It checks every result against PostgreSQL on the same data, and all 390 runs agree.
 
 Measurements: `python3 perf/m1.py`, `perf/m2.py` and `perf/m4.py` regenerate every table of the three reports into `perf/m1/`, `perf/m2/` and `perf/m4/`.
+
+### Running a workload, such as the hidden one
+
+```
+python3 perf/workload.py DATA_DIR queries.sql [--frames 32] [--psql "psql -h HOST -U USER -d SCRATCH_DB"]
+```
+
+`DATA_DIR` holds `schema.sql` (the CREATE TABLE statements) and one CSV file per table, named after the table (`emp.csv` for `Emp`). The script loads the data into a fresh database, runs ANALYZE on every table, and runs each query of `queries.sql` through the `db` shell. It writes `perf/workload/report.md`. For each query, the report gives the rows, the page I/O (reads and writes, temporary files included), the execution time, the estimated against actual rows at the root, and the q-error. It also writes `perf/workload/qNN.txt`, which holds the query's EXPLAIN ANALYZE: its physical plan with estimated and actual rows and I/O per operator. With `--psql`, the script loads the same data into PostgreSQL, replacing its tables of those names, and checks every result. It marks a result where only the order of tied rows differs, which SQL leaves open. It exits 1 if any query fails or differs.
+
+**Compare strings in PostgreSQL's "C" collation.** This engine compares strings byte by byte, as PostgreSQL does under `COLLATE "C"`. Most Linux installs of PostgreSQL default to a language's collation, such as `en_US.UTF-8`, which sorts `apple` before `Banana` where byte order puts `Banana` first. Over mixed-case text that changes ORDER BY, `<` and `>`, MIN and MAX, and even counts such as `WHERE name < 'b'`, for reasons that have nothing to do with correctness. `perf/workload.py` and `tests/e2e/run.py` declare every VARCHAR column `COLLATE "C"` when they load PostgreSQL, so they match on any server. To compare by hand, do the same, or make the database with `CREATE DATABASE scratch LOCALE_PROVIDER libc LOCALE 'C' TEMPLATE template0` (PostgreSQL 15 and later). Without `LOCALE_PROVIDER libc`, a server whose default provider is ICU keeps sorting by language.
 
 Known limitations of Project 2:
 - No NULLs, no arithmetic, no subqueries outside FROM, and no outer joins. It is the subset in the specification and nothing more.

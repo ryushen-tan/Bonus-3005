@@ -3,6 +3,9 @@
 # sql, opt and exec, and writes the tables of REPORT_M4.md to perf/m4/results.md
 import json, os, shutil, statistics, subprocess, sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from compare import statements
+
 OUT = 'perf/m4'
 DB = OUT + '/db'
 FRAMES = 16
@@ -11,10 +14,6 @@ def run(*args):
     r = subprocess.run(list(args), capture_output=True, text=True)
     if r.returncode != 0: sys.exit(' '.join(args) + '\n' + r.stdout + r.stderr)
     return r.stdout
-
-def statements(path):
-    text = ''.join(l for l in open(path) if not l.lstrip().startswith('--'))
-    return [s.strip() + ';' for s in text.split(';') if s.strip()]
 
 def logical(sql):
     open(OUT + '/q.sql', 'w').write(sql)

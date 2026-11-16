@@ -1,16 +1,12 @@
 # Relational algebra query processor
 
-COMP 3005 bonus project 1. A hand-written tokenizer, a recursive descent parser, a parse tree
-printer, the six relational algebra operators, a data generator and a performance study, in C++17
-with no dependencies beyond the standard library. Project 2 turned it into the library the database
-system is built on: relations are bags, `distinct` is its own operator, and the tree reads and writes
-the JSON plan format (see the Project 2 section at the end).
+This is COMP 3005 bonus project 1. It has a tokenizer, a recursive descent parser, a parse tree printer, the six relational algebra operators, a data generator and a performance study. All of it is written by hand in C++17 and uses only the standard library. Project 2 turned it into the library that the database system is built on. Relations are bags (they can hold duplicate tuples), `distinct` is its own operator, and the tree can read and write the JSON plan format (see the Project 2 section at the end).
 
 | file | contents |
 |---|---|
-| `src/lexer.hpp` | tokens and the character by character scanner |
+| `src/lexer.hpp` | tokens and the scanner that reads the query one character at a time |
 | `src/tree.hpp` | parse tree nodes, the tree printer, conditions written back as text |
-| `src/parser.hpp` | one method per grammar rule; `parseQuery` and `parseCondition` |
+| `src/parser.hpp` | one method per grammar rule, plus `parseQuery` and `parseCondition` |
 | `src/algebra.hpp` | relations as bags, tuple order and equality, binding, evaluation, the operators |
 | `src/datafile.hpp` | loading relation definition files and printing relations |
 | `src/treejson.hpp`, `src/json.hpp` | the tree as plan JSON and back; the JSON reader and writer |
@@ -25,7 +21,7 @@ the JSON plan format (see the Project 2 section at the end).
 
 ## Build and run
 
-Needs `clang++` (or `g++` with `make CXX=g++`) and GNU make.
+You need `clang++` (or `g++` with `make CXX=g++`) and GNU make.
 
 ```
 make            builds every tool: ./ra and ./gen (Bonus 1), ./storage ./exec ./sql ./opt and ./db (Project 2)
@@ -61,25 +57,20 @@ Name
 John
 ```
 
-Exit code is 0 on success, 1 on any error, 2 on a usage error (including an unknown flag).
+The exit code is 0 on success, 1 on any error, and 2 on a usage error (including an unknown flag).
 
 ## The language
 
-Full grammar, precedence table and the keyword rule are in `GRAMMAR.md`. In short:
+The full grammar, the precedence table and the keyword rule are in `GRAMMAR.md`. Here is the short version.
 
 ```
 select[ <condition> ]( <expr> )      project[ <attribute-list> ]( <expr> )      rename[ <name> ]( <expr> )
 <expr> union <expr>    <expr> intersect <expr>    <expr> minus <expr>    <expr> times <expr>    <expr> join[ <condition> ] <expr>
 ```
 
-Conditions combine comparisons (`=` `!=` `<` `<=` `>` `>=`) with `not`, `and`, `or` and
-parentheses. An operand is a number, a quoted string, or an attribute, optionally qualified as
-`Emp.DID`. A bare word in a condition is always an attribute, so `select[Name=Bob](R)` is a name
-error and `select[Name='Bob'](R)` is the comparison with a string.
+A condition is made of comparisons (`=` `!=` `<` `<=` `>` `>=`) joined with `not`, `and`, `or` and parentheses. Each side of a comparison is a number, a quoted string, or an attribute. An attribute can be qualified with its relation, like `Emp.DID`. A bare word in a condition is always an attribute. So `select[Name=Bob](R)` is a name error, and `select[Name='Bob'](R)` is the comparison with a string.
 
-Precedence, tightest first: `select`/`project`/`rename` and parentheses, then `times` and `join`,
-then `intersect`, then `union` and `minus`. Everything is left associative, so
-`A union B minus C` is `(A union B) minus C` and `A minus B minus C` is `(A minus B) minus C`.
+Here is the precedence, tightest first. `select`, `project`, `rename` and parentheses bind tightest. Next come `times` and `join`, then `intersect`, then `union` and `minus`. Everything is left associative. So `A union B minus C` is `(A union B) minus C`, and `A minus B minus C` is `(A minus B) minus C`.
 
 ### Data files
 
@@ -92,13 +83,7 @@ Employees (EID, Name, Age, DID) = {
 }
 ```
 
-One header line, one tuple per line with exactly as many values as attributes, and `}` alone on a
-line. Blank lines and lines starting with `//` are ignored. A value that contains a comma, a space,
-a parenthesis or a quote must be quoted with single quotes, and `''` inside quotes is one quote
-(`'O''Brien'`). A bare value is a number if it looks like one (`32`, `-30`, `2.5`), otherwise it is a
-string (`E1`, `D-1`, `2024-01-01`); `'32'` is a string. Two more values need quotes because of the
-line rules: a value that starts with `//` and the single character `}`. Numbers must fit in a double.
-A relation is a bag, so a tuple written twice is there twice.
+A relation has one header line. After that comes one tuple per line, with exactly as many values as attributes, and then a `}` alone on a line. Blank lines and lines starting with `//` are ignored. A value that has a comma, a space, a parenthesis or a quote in it must be quoted with single quotes. Inside quotes, `''` means one quote (`'O''Brien'`). A bare value is a number if it looks like one (`32`, `-30`, `2.5`). Otherwise it is a string (`E1`, `D-1`, `2024-01-01`). `'32'` is a string. Two more kinds of value need quotes because of the line rules: a value that starts with `//`, and the single character `}`. Numbers must fit in a double. A relation is a bag, so a tuple written twice is there twice.
 
 ### Semantics
 
@@ -108,27 +93,17 @@ A relation is a bag, so a tuple written twice is there twice.
 | `project[a, b](e)` | the listed attributes in the listed order, duplicates kept; listing the same attribute twice is a schema error |
 | `distinct(e)` | same schema as `e`, duplicate tuples removed |
 | `rename[X](e)` | same attributes, now belonging to relation `X`; a schema error if two attributes would then share a name |
-| `e times f` | all attributes of both, each remembered with its relation name; a duplicate qualified name is a schema error |
-| `e join[c] f` | `times` followed by `select[c]`, evaluated pair by pair without building the product; the comparison counter is the same for both spellings |
-| `union`, `intersect`, `minus` | set semantics, the result has no duplicates; schema of the left input; the inputs must have the same number of attributes, the same names in the same order (relation qualifiers are ignored) and the same type in each position; the unknown type of an empty relation matches either type and the result column takes the other side's type |
+| `e times f` | all attributes of both, each keeping its relation name; a duplicate qualified name is a schema error |
+| `e join[c] f` | `times` followed by `select[c]`, checked pair by pair without building the whole product; the comparison counter is the same for both spellings |
+| `union`, `intersect`, `minus` | set semantics, so the result has no duplicates; the schema is the left input's; the inputs must have the same number of attributes, the same names in the same order (relation qualifiers are ignored) and the same type in each position; the unknown type of an empty relation matches either type, and the result column takes the other side's type |
 
-Every attribute is `(relation, name, type)`. A base relation's attributes belong to it; `rename`
-changes the relation of all of them; `times` and `join` keep both sides' relation names. In a
-condition or a projection list an unqualified name must match exactly one attribute (two matches is
-an ambiguity error, none is a name error) and `Rel.name` must match exactly.
+Every attribute is a triple of relation, name and type. A base relation's attributes belong to that relation. `rename` changes the relation of all of them. `times` and `join` keep both sides' relation names. In a condition or a projection list, an unqualified name must match exactly one attribute. Two matches is an ambiguity error and no match is a name error. A name written as `Rel.name` must match exactly.
 
-Types are inferred from the data: a column is a number column or a string column, or unknown for a
-relation with no tuples. A column that mixes both is a type error when the file is loaded. Comparing
-a number with a string (`select[Age>'30'](R)`) is a type error, decided before any tuple is
-examined. Numbers compare by value (`1` and `1.0` are equal), strings compare bytewise.
+Types are worked out from the data. A column is a number column or a string column, or "unknown" if the relation has no tuples. A column that mixes both is a type error when the file is loaded. Comparing a number with a string (`select[Age>'30'](R)`) is also a type error, and it is found before any tuple is looked at. Numbers compare by value (`1` and `1.0` are equal). Strings compare byte by byte.
 
 ### Output
 
-The header lists the attribute names joined by `, `, qualified as `Rel.name` only when the result
-mixes attributes of more than one relation. Then one tuple per line, in sorted order, values written
-the way the data file would write them (strings are quoted only when they have to be). A result with
-no tuples prints only the header. The output is itself a valid tuple body, so it can be pasted back
-into a data file.
+The header lists the attribute names joined by `, `. A name is written as `Rel.name` only when the result mixes attributes from more than one relation. After the header comes one tuple per line, in sorted order. Values are written the way the data file would write them (strings are quoted only when they have to be). A result with no tuples prints only the header. The output is itself a valid tuple body, so you can paste it back into a data file.
 
 ```
 $ ./ra tests/data.txt "Emp join[Emp.DID=Dept.DID] Dept"
@@ -140,8 +115,7 @@ E3, Bob, E0, D1, D1, Sales
 
 ### Errors
 
-Every error is one line, `<category> error: <message>`, with `at line L col C` when a position is
-known, and the program exits with 1. There are no stack traces. The categories:
+Every error is one line, `<category> error: <message>`, with `at line L col C` added when the position is known. The program then exits with 1. There are no stack traces. These are the categories:
 
 ```
 lexical error: unterminated string at line 1 col 13                              select[Name='Bob](R)
@@ -157,9 +131,7 @@ type error: cannot compare number Age with string '30' at line 1 col 11         
 io error: cannot open nope.txt
 ```
 
-Data file problems (wrong number of values on a line, a column mixing numbers and strings, an
-unquoted value containing a space, a duplicate relation or attribute, a missing `}`) are reported
-the same way with the line number in the file.
+Problems in a data file are reported the same way, with the line number in the file. These include a wrong number of values on a line, a column that mixes numbers and strings, an unquoted value with a space in it, a duplicate relation or attribute, and a missing `}`.
 
 ## Why the self join needs rename (test case 20)
 
@@ -167,57 +139,30 @@ the same way with the line number in the file.
 rename[E2](Emp) join[Emp.MgrID=E2.EID] Emp
 ```
 
-Without `rename` the only way to pair employees with their managers is `Emp times Emp` or
-`Emp join[...] Emp`. Both produce a schema whose attributes are `Emp.EID, Emp.Name, Emp.MgrID,
-Emp.DID` twice, and the assignment says a collision of qualified names is an error, because a
-condition like `Emp.MgrID = Emp.EID` could not say which copy it means (and evaluated within a single
-copy, `select[MgrID=EID](Emp)` only finds people who manage themselves). `rename[E2]` gives the second
-copy a different relation name, so `E2.EID` and `Emp.EID` are distinct attributes, the product has a
-legal schema, and the condition can refer to the manager's id on one side and the employee's manager
-field on the other.
+Without `rename`, the only way to pair employees with their managers is `Emp times Emp` or `Emp join[...] Emp`. Both give a schema with the attributes `Emp.EID, Emp.Name, Emp.MgrID, Emp.DID` twice. The assignment says a clash of qualified names is an error. That makes sense, because a condition like `Emp.MgrID = Emp.EID` couldn't say which copy it means. (And if you ran it on a single copy, `select[MgrID=EID](Emp)` would only find people who manage themselves.) `rename[E2]` gives the second copy a different relation name. Now `E2.EID` and `Emp.EID` are different attributes, the product has a legal schema, and the condition can use the manager's id on one side and the employee's manager field on the other.
 
 ## Performance study
 
-`make perf` generates `R(a, b)` and `S(b, c)` at 1000 to 64000 tuples per relation with `./gen`,
-runs the join, a selection and a projection at each size with `--stats`, and sweeps the match rate.
-The match rate `k` is exact when `k` divides `m`: every run of `k` consecutive S tuples shares one `b`
-value and R cycles through those values; `k = 0` gives no matches.
-The comparison counter increments once for every pair of tuples the join examines and once for
-every tuple a selection examines; it is counted, never estimated. `--stats` reports the counter, the
-number of output tuples and the wall time of evaluating the tree (loading, parsing and printing are
-excluded). Results and the answers to the questions are in `REPORT.md`.
+`make perf` uses `./gen` to generate `R(a, b)` and `S(b, c)` with 1000 to 64000 tuples per relation. At each size it runs the join, a selection and a projection with `--stats`. It also sweeps the match rate. The match rate `k` is exact when `k` divides `m`. Every run of `k` consecutive S tuples shares one `b` value, and R cycles through those values. With `k = 0` there are no matches.
+
+The comparison counter goes up once for every pair of tuples the join looks at, and once for every tuple a selection looks at. It is counted, never estimated. `--stats` reports the counter, the number of output tuples and the wall time of evaluating the tree (loading, parsing and printing are left out). The results and the answers to the questions are in `REPORT.md`.
 
 ## Tests
 
-`make test` runs `tests/test.cpp`: a table of `{name, arguments, expected output, exit code,
-expected comparison count}`. Each entry calls the same `run` function as `main` with an in-memory
-output stream and compares the whole output byte for byte, so the suite is deterministic and needs
-no shell. Entries `01` to `25` are the assignment's cases in order; `x01` onwards are extras,
-including the "other grouping gives a different answer" checks for cases 10 to 13.
+`make test` runs `tests/test.cpp`. It is a table of `{name, arguments, expected output, exit code, expected comparison count}`. Each entry calls the same `run` function as `main`, with an in-memory output stream, and compares the whole output byte for byte. So the suite gives the same result every time and doesn't need a shell. Entries `01` to `25` are the assignment's cases in order. The entries from `x01` onwards are extras. They include the "other grouping gives a different answer" checks for cases 10 to 13.
 
 ## Known limitations
 
-- No nulls, no arithmetic in conditions, no aggregation, no natural join: the assignment's language
-  and nothing more.
-- A relation named `select`, `project` or `rename` cannot be queried, and an attribute named `not`
-  cannot start a comparison (see the keyword rule in `GRAMMAR.md`).
-- Numbers are stored as doubles; integers above 2^53 lose precision when compared.
-- Everything is in memory; the join is a nested loop with no indexes, which the performance study
-  measures on purpose.
-- Two limits stop deep input from overflowing the stack. They produce `syntax error: nesting too deep`
-  or `syntax error: condition too long` instead of a crash. First, the parser allows at most 500
-  parentheses, unary operators and `not`s open at once, so 500 nested parentheses parse and 501 do not.
-  Second, a parse tree may be at most 500 levels of nesting and 2000 levels in all. A chain of `and`s
-  or `or`s counts as one level of nesting, so a 2000-term condition is "condition too long". A chain of
-  499 `union`s parses and 500 do not, and each unary operator or `not` adds a level. The SQL front end
-  has its own limits, in GRAMMAR_SQL.md §5, and a plan file may nest as deep as the deepest plan a
-  statement within them can become, 45514 levels.
-- Columns in error positions count bytes, so a multibyte character counts as more than one column.
+- No nulls, no arithmetic in conditions, no aggregation and no natural join. It is the assignment's language and nothing more.
+- A relation named `select`, `project` or `rename` cannot be queried. An attribute named `not` cannot start a comparison (see the keyword rule in `GRAMMAR.md`).
+- Numbers are stored as doubles, so integers above 2^53 lose precision when compared.
+- Everything is in memory. The join is a nested loop with no indexes, and the performance study measures that on purpose.
+- Two limits stop deep input from overflowing the stack. They give `syntax error: nesting too deep` or `syntax error: condition too long` instead of a crash. First, the parser allows at most 500 open parentheses, unary operators and `not`s at once. So 500 nested parentheses parse and 501 do not. Second, a parse tree may be at most 500 levels of nesting and 2000 levels in all. A chain of `and`s or `or`s counts as one level of nesting, so a 2000-term condition is "condition too long". A chain of 499 `union`s parses and 500 do not, and each unary operator or `not` adds a level. The SQL front end has its own limits, in GRAMMAR_SQL.md section 5. A plan file may nest as deep as the deepest plan a statement within those limits can become, 45514 levels.
+- Columns in error positions count bytes, so a character that takes several bytes counts as more than one column.
 
 ## Project 2: the database system
 
-Text goes in as SQL, a plan comes out, and tuples are read from pages on disk through the buffer pool.
-`ARCHITECTURE.md` has the picture and the interface between each pair of modules.
+SQL text goes in, a plan comes out, and tuples are read from pages on disk through the buffer pool. `ARCHITECTURE.md` has the picture and the interface between each pair of modules.
 
 ```
 $ ./db --db mydb                         an interactive prompt; or --file script.sql, or SQL on standard input
@@ -230,7 +175,7 @@ db> EXPLAIN SELECT ...;                  the physical plan with estimated rows a
 db> EXPLAIN ANALYZE SELECT ...;          the plan run, estimated against actual rows and I/O per node
 ```
 
-Every module also runs on its own, exactly as its specification asks:
+Every module also runs on its own, just as its specification asks:
 
 ```
 storage create-table --db DIR --name R --schema "a:INT,b:VARCHAR(20)"   storage load --db DIR --table R --file r.csv
@@ -253,38 +198,17 @@ opt plan ... --baseline                      the unoptimised plan;  --without-ru
 | M4 optimizer | `optimizer.hpp` `opt.hpp` | DESIGN_M4.md, REPORT_M4.md |
 | integration | `shell.hpp` `cli.hpp` | ARCHITECTURE.md |
 
-Tests (`make test`): `tests/test.cpp` (the 25 Bonus 1 cases under bag semantics, and a JSON round trip of
-every node type), `tests/test_storage.cpp` (M1's worked examples, error table and checklist),
-`tests/test_exec.cpp` (M2's examples and checklist, and 64 plans checked against the Bonus 1 engine at
-B = 4, 5, 8 and 64), `tests/test_sql.cpp` (M3's seven examples and fifteen cases), and
-`tests/test_opt.cpp` (M4's examples and checklist, SQL run through all four modules optimised and
-unoptimised, and the `db` shell's commands and error positions). `python3 tests/e2e/run.py SCALE "psql connection args"` runs 44 queries
-through the four tools chained by file, optimised and unoptimised, and through the `db` shell, at B = 4,
-8 and 32, and checks every result against PostgreSQL on the same data; all 390 runs agree.
+Tests (`make test`): `tests/test.cpp` has the 25 Bonus 1 cases under bag semantics, plus a JSON round trip of every node type. `tests/test_storage.cpp` has M1's worked examples, error table and checklist. `tests/test_exec.cpp` has M2's examples and checklist, and 64 plans checked against the Bonus 1 engine at B = 4, 5, 8 and 64. `tests/test_sql.cpp` has M3's seven examples and fifteen cases. `tests/test_opt.cpp` has M4's examples and checklist, SQL run through all four modules optimised and unoptimised, and the `db` shell's commands and error positions. `python3 tests/e2e/run.py SCALE "psql connection args"` runs 44 queries through the four tools chained by file, optimised and unoptimised, and through the `db` shell, at B = 4, 8 and 32. It checks every result against PostgreSQL on the same data, and all 390 runs agree.
 
-Measurements: `python3 perf/m1.py`, `perf/m2.py` and `perf/m4.py` regenerate every table of the three
-reports into `perf/m1/`, `perf/m2/` and `perf/m4/`.
+Measurements: `python3 perf/m1.py`, `perf/m2.py` and `perf/m4.py` regenerate every table of the three reports into `perf/m1/`, `perf/m2/` and `perf/m4/`.
 
 Known limitations of Project 2:
-- No NULLs, no arithmetic, no subqueries outside FROM, and no outer joins: the subset of the
-  specification and nothing more.
-- No compaction of deleted space, and no index.
-- A record must fit on one page, so it can be at most 4084 bytes: a longer row is refused when it is
-  loaded or inserted, and a join of two very wide tables (over 4084 bytes together) cannot be sorted or
-  partitioned.
-- Identifiers are case sensitive, as Module 3 requires, so unlike PostgreSQL `emp` is not `Emp`. But
-  each table is a file, so two table names that differ only in case are refused (they would share a
-  file on a case-insensitive file system), and no table may be called `catalog`.
+- No NULLs, no arithmetic, no subqueries outside FROM, and no outer joins. It is the subset in the specification and nothing more.
+- Deleted space is never compacted, and there is no index.
+- A record must fit on one page, so it can be at most 4084 bytes. A longer row is refused when it is loaded or inserted. A join of two very wide tables (over 4084 bytes together) cannot be sorted or partitioned.
+- Identifiers are case sensitive, as Module 3 requires, so unlike PostgreSQL `emp` is not `Emp`. But each table is a file, so two table names that differ only in case are refused (they would share a file on a case-insensitive file system). No table may be called `catalog`.
 - A plan needs at least 4 frames (`opt plan`, `SET frames`, `db --frames`).
-- A statement may nest at most 450 levels of parentheses, NOT and subqueries, a condition may hold at
-  most 1000 comparisons, a statement at most 1000 set operators, and a FROM clause at most 16 tables
-  (GRAMMAR_SQL.md §5). PostgreSQL has no such limits short of its stack. Within them the optimizer's
-  time grows with the square of the plan's depth: 449 nested blocks of 16 tables each take the shell
-  four minutes.
-- The set operators have one precedence, as the specification says, where PostgreSQL binds INTERSECT
-  tighter: `A UNION B INTERSECT C` is `(A UNION B) INTERSECT C` here (GRAMMAR_SQL.md §3).
-- With rule 7 off (`opt plan --without-rules 7`) a statement that nests blocks each with many conjuncts
-  can make a plan deeper than `exec` reads; with every rule on, as in the shell, none can.
-- AVG is a double, rounded to four places from the shortest decimal that reads back as it. So every
-  exact half prints as PostgreSQL prints it, but an average near 10^9 over hundreds of thousands of rows
-  that is closer to a half than a double can tell apart may print one ten-thousandth away.
+- A statement may nest at most 450 levels of parentheses, NOT and subqueries. A condition may hold at most 1000 comparisons, a statement at most 1000 set operators, and a FROM clause at most 16 tables (GRAMMAR_SQL.md section 5). PostgreSQL has no such limits short of its stack. Within them the optimizer's time grows with the square of the plan's depth. For example, 449 nested blocks of 16 tables each take the shell four minutes.
+- The set operators have one precedence, as the specification says, where PostgreSQL binds INTERSECT tighter. So `A UNION B INTERSECT C` is `(A UNION B) INTERSECT C` here (GRAMMAR_SQL.md section 3).
+- With rule 7 off (`opt plan --without-rules 7`), a statement that nests blocks that each have many conjuncts can make a plan deeper than `exec` reads. With every rule on, as in the shell, that can't happen.
+- AVG is a double, rounded to four places from the shortest decimal that reads back as it. So every exact half prints as PostgreSQL prints it. But an average near 10^9 over hundreds of thousands of rows, if it is closer to a half than a double can tell apart, may print one ten-thousandth away.
